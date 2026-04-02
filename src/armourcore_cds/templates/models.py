@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class DesignArea(BaseModel):
@@ -9,6 +9,8 @@ class DesignArea(BaseModel):
 
 
 class TemplateModel(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+
     template_id: str
     display_name: str
     design_area_mm: DesignArea

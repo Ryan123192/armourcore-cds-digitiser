@@ -1,0 +1,753 @@
+diff --git a/configs/templates/cds_regular_500x600.yaml b/configs/templates/cds_regular_500x600.yaml
+index d94580b..2c11536 100644
+--- a/configs/templates/cds_regular_500x600.yaml
++++ b/configs/templates/cds_regular_500x600.yaml
+@@ -2,9 +2,7 @@ template_id: cds_regular_500x600
+ display_name: cds_regular_500x600
+ design_area_mm:
+   width: 500
+-500
+   height: 600
+-900
+ crop_rule: inside_most_edge_of_thick_outer_border
+ preferred_output_dpi: 400
+ primary_geometry_truth: outer_border
+diff --git a/src/armourcore_cds/io/loaders.py b/src/armourcore_cds/io/loaders.py
+index b217284..e6967d1 100644
+--- a/src/armourcore_cds/io/loaders.py
++++ b/src/armourcore_cds/io/loaders.py
+@@ -2,6 +2,39 @@ from __future__ import annotations
+ 
+ from pathlib import Path
+ 
++import cv2
++import numpy as np
+ 
+-def load_input(path: Path):
+-    raise NotImplementedError
++from armourcore_cds.io.pdf_render import render_pdf_first_page
++
++SUPPORTED_IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
++SUPPORTED_PDF_SUFFIXES = {'.pdf'}
++
++
++def load_input(path: Path, pdf_dpi: int = 400) -> tuple[np.ndarray, dict]:
++    """Load one image or single-page PDF as a BGR uint8 raster."""
++    if not path.exists():
++        raise FileNotFoundError(path)
++
++    suffix = path.suffix.lower()
++    if suffix in SUPPORTED_PDF_SUFFIXES:
++        image = render_pdf_first_page(path, dpi=pdf_dpi)
++        meta = {
++            'input_kind': 'pdf',
++            'source_suffix': suffix,
++            'pdf_render_dpi': pdf_dpi,
++        }
++        return image, meta
++
++    if suffix in SUPPORTED_IMAGE_SUFFIXES:
++        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
++        if image is None:
++            raise ValueError(f'OpenCV could not load image: {path}')
++        meta = {
++            'input_kind': 'image',
++            'source_suffix': suffix,
++            'pdf_render_dpi': None,
++        }
++        return image, meta
++
++    raise ValueError(f'Unsupported input type: {suffix}')
+diff --git a/src/armourcore_cds/io/pdf_render.py b/src/armourcore_cds/io/pdf_render.py
+index 73b94b3..2eac501 100644
+--- a/src/armourcore_cds/io/pdf_render.py
++++ b/src/armourcore_cds/io/pdf_render.py
+@@ -2,6 +2,21 @@ from __future__ import annotations
+ 
+ from pathlib import Path
+ 
++import fitz  # pymupdf
++import numpy as np
+ 
+-def render_pdf_first_page(path: Path, dpi: int = 400):
+-    raise NotImplementedError
++
++def render_pdf_first_page(path: Path, dpi: int = 400) -> np.ndarray:
++    """Render the first page of a single-page PDF to a BGR uint8 image."""
++    doc = fitz.open(path)
++    if doc.page_count < 1:
++        raise ValueError(f"PDF has no pages: {path}")
++
++    page = doc.load_page(0)
++    scale = dpi / 72.0
++    matrix = fitz.Matrix(scale, scale)
++    pix = page.get_pixmap(matrix=matrix, alpha=False)
++    data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
++    rgb = data[:, :, :3]
++    bgr = rgb[:, :, ::-1].copy()
++    return bgr
+diff --git a/src/armourcore_cds/phase1/boundary_detection.py b/src/armourcore_cds/phase1/boundary_detection.py
+index cbed828..ddfd29b 100644
+--- a/src/armourcore_cds/phase1/boundary_detection.py
++++ b/src/armourcore_cds/phase1/boundary_detection.py
+@@ -1,2 +1,114 @@
+-"""Phase 1 module: boundary_detection"""
+ from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++import cv2
++import numpy as np
++
++from armourcore_cds.utils.image_ops import to_gray
++
++
++@dataclass
++class BorderDetectionResult:
++    contour: np.ndarray
++    ordered_corners: np.ndarray
++    preview_edges: np.ndarray
++    preview_mask: np.ndarray
++    contour_area_px: float
++    score: float
++    candidate_count: int
++
++
++def _order_points_clockwise(points: np.ndarray) -> np.ndarray:
++    pts = points.astype(np.float32)
++    s = pts.sum(axis=1)
++    diff = np.diff(pts, axis=1).reshape(-1)
++    ordered = np.zeros((4, 2), dtype=np.float32)
++    ordered[0] = pts[np.argmin(s)]      # top-left
++    ordered[2] = pts[np.argmax(s)]      # bottom-right
++    ordered[1] = pts[np.argmin(diff)]   # top-right
++    ordered[3] = pts[np.argmax(diff)]   # bottom-left
++    return ordered
++
++
++def _contour_score(contour: np.ndarray, image_shape: tuple[int, int], expected_aspect_ratio: float) -> tuple[float, np.ndarray] | None:
++    perimeter = cv2.arcLength(contour, True)
++    if perimeter <= 0:
++        return None
++
++    approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
++    if len(approx) != 4 or not cv2.isContourConvex(approx):
++        return None
++
++    area = cv2.contourArea(approx)
++    if area <= 0:
++        return None
++
++    h, w = image_shape[:2]
++    image_area = float(h * w)
++    area_ratio = area / image_area
++    if area_ratio < 0.12:
++        return None
++
++    rect = _order_points_clockwise(approx.reshape(4, 2))
++    top_w = float(np.linalg.norm(rect[1] - rect[0]))
++    bot_w = float(np.linalg.norm(rect[2] - rect[3]))
++    left_h = float(np.linalg.norm(rect[3] - rect[0]))
++    right_h = float(np.linalg.norm(rect[2] - rect[1]))
++    mean_w = max((top_w + bot_w) * 0.5, 1.0)
++    mean_h = max((left_h + right_h) * 0.5, 1.0)
++    aspect_ratio = mean_w / mean_h
++    aspect_error = abs(np.log(aspect_ratio / expected_aspect_ratio))
++
++    contour_pts = approx.reshape(4, 2).astype(np.float32)
++    contour_center = contour_pts.mean(axis=0)
++    image_center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
++    centre_distance = float(np.linalg.norm(contour_center - image_center))
++    max_centre_distance = float(np.linalg.norm(image_center))
++    centre_penalty = centre_distance / max(max_centre_distance, 1.0)
++
++    extent = area / max(cv2.contourArea(cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.float32)), 1.0)
++    score = (area_ratio * 4.0) + (extent * 1.5) - (aspect_error * 2.5) - (centre_penalty * 0.5)
++    return score, rect
++
++
++def detect_outer_border(image: np.ndarray, expected_aspect_ratio: float) -> BorderDetectionResult:
++    gray = to_gray(image)
++    blur = cv2.GaussianBlur(gray, (5, 5), 0)
++
++    edges = cv2.Canny(blur, 50, 150)
++    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
++    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
++    dilated = cv2.dilate(closed, kernel, iterations=1)
++
++    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
++    best_score = None
++    best_rect = None
++    best_contour = None
++
++    for contour in contours:
++        scored = _contour_score(contour, image.shape, expected_aspect_ratio)
++        if scored is None:
++            continue
++        score, rect = scored
++        if best_score is None or score > best_score:
++            best_score = score
++            best_rect = rect
++            best_contour = contour
++
++    if best_rect is None or best_contour is None or best_score is None:
++        raise RuntimeError('Could not detect CDS outer border candidate.')
++
++    mask = np.zeros_like(gray)
++    cv2.drawContours(mask, [best_contour], -1, 255, thickness=cv2.FILLED)
++
++    return BorderDetectionResult(
++        contour=best_contour,
++        ordered_corners=best_rect,
++        preview_edges=dilated,
++        preview_mask=mask,
++        contour_area_px=float(cv2.contourArea(best_contour)),
++        score=float(best_score),
++        candidate_count=len(contours),
++    )
+diff --git a/src/armourcore_cds/phase1/crop.py b/src/armourcore_cds/phase1/crop.py
+index 8c5a540..8df3591 100644
+--- a/src/armourcore_cds/phase1/crop.py
++++ b/src/armourcore_cds/phase1/crop.py
+@@ -1,2 +1,114 @@
+-"""Phase 1 module: crop"""
+ from __future__ import annotations
++
++from dataclasses import dataclass
++
++import cv2
++import numpy as np
++
++from armourcore_cds.utils.image_ops import to_gray
++
++
++@dataclass
++class InnerBorderCropResult:
++    cropped_image: np.ndarray
++    inner_rect_xyxy: tuple[int, int, int, int]
++    border_samples_px: dict[str, int]
++    preview_binary: np.ndarray
++
++
++def _scan_dark_run(profile: np.ndarray, threshold: int, min_run: int) -> int:
++    run = 0
++    start = 0
++    for idx, value in enumerate(profile):
++        if value <= threshold:
++            if run == 0:
++                start = idx
++            run += 1
++            if run >= min_run:
++                return start
++        else:
++            run = 0
++    return 0
++
++
++def _scan_dark_run_reverse(profile: np.ndarray, threshold: int, min_run: int) -> int:
++    run = 0
++    end = len(profile) - 1
++    for rev_idx, value in enumerate(profile[::-1]):
++        idx = len(profile) - 1 - rev_idx
++        if value <= threshold:
++            if run == 0:
++                end = idx
++            run += 1
++            if run >= min_run:
++                return end
++        else:
++            run = 0
++    return len(profile) - 1
++
++
++def find_inner_border_crop(rectified_image: np.ndarray) -> InnerBorderCropResult:
++    gray = to_gray(rectified_image)
++    blur = cv2.GaussianBlur(gray, (5, 5), 0)
++    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
++
++    margin_y = max(5, rectified_image.shape[0] // 20)
++    margin_x = max(5, rectified_image.shape[1] // 20)
++
++    top_band = blur[:margin_y, :]
++    bottom_band = blur[-margin_y:, :]
++    left_band = blur[:, :margin_x]
++    right_band = blur[:, -margin_x:]
++
++    top_profile = top_band.mean(axis=1)
++    bottom_profile = bottom_band.mean(axis=1)
++    left_profile = left_band.mean(axis=0)
++    right_profile = right_band.mean(axis=0)
++
++    threshold = int(np.clip(np.percentile(np.concatenate([top_profile, bottom_profile, left_profile, right_profile]), 35), 30, 220))
++    min_run_y = max(3, margin_y // 6)
++    min_run_x = max(3, margin_x // 6)
++
++    top_outer = _scan_dark_run(top_profile, threshold, min_run_y)
++    bottom_outer_local = _scan_dark_run_reverse(bottom_profile, threshold, min_run_y)
++    left_outer = _scan_dark_run(left_profile, threshold, min_run_x)
++    right_outer_local = _scan_dark_run_reverse(right_profile, threshold, min_run_x)
++
++    top_band_dark = top_profile <= threshold
++    left_band_dark = left_profile <= threshold
++    bottom_band_dark = bottom_profile <= threshold
++    right_band_dark = right_profile <= threshold
++
++    top_inner = top_outer
++    while top_inner < len(top_band_dark) and top_band_dark[top_inner]:
++        top_inner += 1
++
++    left_inner = left_outer
++    while left_inner < len(left_band_dark) and left_band_dark[left_inner]:
++        left_inner += 1
++
++    bottom_inner_local = bottom_outer_local
++    while bottom_inner_local >= 0 and bottom_band_dark[bottom_inner_local]:
++        bottom_inner_local -= 1
++
++    right_inner_local = right_outer_local
++    while right_inner_local >= 0 and right_band_dark[right_inner_local]:
++        right_inner_local -= 1
++
++    x0 = int(np.clip(left_inner, 0, rectified_image.shape[1] - 2))
++    y0 = int(np.clip(top_inner, 0, rectified_image.shape[0] - 2))
++    x1 = int(np.clip(rectified_image.shape[1] - margin_x + right_inner_local, x0 + 1, rectified_image.shape[1] - 1))
++    y1 = int(np.clip(rectified_image.shape[0] - margin_y + bottom_inner_local, y0 + 1, rectified_image.shape[0] - 1))
++
++    cropped = rectified_image[y0:y1, x0:x1].copy()
++    return InnerBorderCropResult(
++        cropped_image=cropped,
++        inner_rect_xyxy=(x0, y0, x1, y1),
++        border_samples_px={
++            'top': int(y0),
++            'bottom': int(rectified_image.shape[0] - y1),
++            'left': int(x0),
++            'right': int(rectified_image.shape[1] - x1),
++        },
++        preview_binary=binary,
++    )
+diff --git a/src/armourcore_cds/phase1/pipeline.py b/src/armourcore_cds/phase1/pipeline.py
+index 493d674..39631ce 100644
+--- a/src/armourcore_cds/phase1/pipeline.py
++++ b/src/armourcore_cds/phase1/pipeline.py
+@@ -3,35 +3,133 @@ from __future__ import annotations
+ from datetime import datetime
+ from pathlib import Path
+ 
++import cv2
+ import yaml
+ 
++from armourcore_cds.io.loaders import load_input
+ from armourcore_cds.io.run_report import write_run_report
+ from armourcore_cds.io.save import ensure_run_dir
++from armourcore_cds.phase1.boundary_detection import detect_outer_border
++from armourcore_cds.phase1.crop import find_inner_border_crop
++from armourcore_cds.phase1.rectify import rectify_from_corners
++from armourcore_cds.phase1.scaling import scale_to_template_design_area
+ from armourcore_cds.templates.registry import load_template_config
++from armourcore_cds.utils.debug import DebugWriter
++from armourcore_cds.utils.image_ops import draw_polygon, resize_long_edge, stack_debug_h, to_gray, save_image
+ 
+ 
+ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -> Path:
+-    app_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
++    app_config = yaml.safe_load(config_path.read_text(encoding='utf-8'))
+     template = load_template_config(template_id)
+ 
+     run_name = f"{datetime.now():%Y-%m-%d_%H%M%S}_{input_path.stem}"
+-    base_dir = Path(app_config["output"]["base_dir"])
++    base_dir = Path(app_config['output']['base_dir'])
+     run_dir = ensure_run_dir(base_dir, run_name)
++    debug = DebugWriter(run_dir / 'debug', enabled=bool(app_config['output'].get('write_debug_images', True)))
++
++    preferred_output_dpi = int(template.preferred_output_dpi or app_config['processing']['preferred_output_dpi'])
++    input_image, input_meta = load_input(input_path, pdf_dpi=preferred_output_dpi)
++
++    debug.image('01_input_original', input_image)
++
++    expected_aspect_ratio = float(template.design_area_mm.width) / float(template.design_area_mm.height)
++    border = detect_outer_border(input_image, expected_aspect_ratio=expected_aspect_ratio)
++
++    contour_overlay = draw_polygon(input_image, border.ordered_corners, (0, 255, 0), thickness=6)
++    debug.image('02_border_edges', cv2.cvtColor(border.preview_edges, cv2.COLOR_GRAY2BGR))
++    debug.image('03_border_mask', cv2.cvtColor(border.preview_mask, cv2.COLOR_GRAY2BGR))
++    debug.image('04_border_detected', contour_overlay)
++
++    rectified = rectify_from_corners(input_image, border.ordered_corners, expected_aspect_ratio=expected_aspect_ratio)
++    debug.image('05_rectified_outer', rectified.image)
++
++    crop_result = find_inner_border_crop(rectified.image)
++    crop_preview = rectified.image.copy()
++    x0, y0, x1, y1 = crop_result.inner_rect_xyxy
++    cv2.rectangle(crop_preview, (x0, y0), (x1, y1), (0, 255, 0), 4)
++    debug.image('06_inner_border_binary', cv2.cvtColor(crop_result.preview_binary, cv2.COLOR_GRAY2BGR))
++    debug.image('07_inner_crop_preview', crop_preview)
++    debug.image('08_cropped_design_area_raw', crop_result.cropped_image)
++
++    scaled = scale_to_template_design_area(
++        crop_result.cropped_image,
++        width_mm=template.design_area_mm.width,
++        height_mm=template.design_area_mm.height,
++        output_dpi=preferred_output_dpi,
++    )
++    debug.image('09_scaled_design_area', scaled.image)
++
++    save_image(run_dir / 'rectified_outer.png', rectified.image)
++    save_image(run_dir / 'cropped_design_area_raw.png', crop_result.cropped_image)
++    save_image(run_dir / 'scaled_design_area.png', scaled.image)
++
++    summary_preview = stack_debug_h(
++        resize_long_edge(contour_overlay, 1400),
++        resize_long_edge(crop_preview, 1400),
++    )
++    summary_preview = debug.text_overlay(summary_preview, [
++        f'template={template.template_id}',
++        f'input={input_meta["input_kind"]}',
++        f'output_px={scaled.output_size_px[0]}x{scaled.output_size_px[1]}',
++    ])
++    debug.image('10_summary_preview', summary_preview)
+ 
+     report = {
+-        "input_path": str(input_path),
+-        "template_id": template.template_id,
+-        "template_display_name": template.display_name,
+-        "design_area_mm": {
+-            "width": template.design_area_mm.width,
+-            "height": template.design_area_mm.height,
++        'input_path': str(input_path),
++        'template_id': template.template_id,
++        'template_display_name': template.display_name,
++        'phase': 'phase1_rectify_clean',
++        'status': 'success',
++        'input': {
++            **input_meta,
++            'width_px': int(input_image.shape[1]),
++            'height_px': int(input_image.shape[0]),
++        },
++        'design_area_mm': {
++            'width': template.design_area_mm.width,
++            'height': template.design_area_mm.height,
++        },
++        'border_detection': {
++            'ordered_corners_xy': border.ordered_corners.round(2).tolist(),
++            'contour_area_px': border.contour_area_px,
++            'score': border.score,
++            'candidate_count': border.candidate_count,
++        },
++        'rectification': {
++            'rectified_outer_size_px': {
++                'width': rectified.rectified_size_px[0],
++                'height': rectified.rectified_size_px[1],
++            },
++            'inner_crop_xyxy_px': {
++                'x0': x0,
++                'y0': y0,
++                'x1': x1,
++                'y1': y1,
++            },
++            'inner_border_margins_px': crop_result.border_samples_px,
++        },
++        'scaling': {
++            'output_dpi': preferred_output_dpi,
++            'scaled_size_px': {
++                'width': scaled.output_size_px[0],
++                'height': scaled.output_size_px[1],
++            },
++            'px_per_mm_x': scaled.px_per_mm_x,
++            'px_per_mm_y': scaled.px_per_mm_y,
++            'effective_dpi_x': scaled.effective_dpi_x,
++            'effective_dpi_y': scaled.effective_dpi_y,
++        },
++        'outputs': {
++            'rectified_outer': 'rectified_outer.png',
++            'cropped_design_area_raw': 'cropped_design_area_raw.png',
++            'scaled_design_area': 'scaled_design_area.png',
++            'debug_dir': 'debug',
+         },
+-        "phase": "phase1_rectify_clean",
+-        "status": "scaffold_only",
+-        "notes": [
+-            "Pipeline scaffold created.",
+-            "Phase 01 implementation pending."
++        'assumptions': [
++            'The strongest external quadrilateral contour corresponds to the CDS outer border.',
++            'The inside-most edge of the thick border can be recovered after rectification by scanning inward from each edge.',
++            'This first pass prioritises deterministic geometry recovery, not artefact suppression or trace extraction.',
+         ],
+     }
+-    write_run_report(run_dir / "run_report.json", report)
++    write_run_report(run_dir / 'run_report.json', report)
+     return run_dir
+diff --git a/src/armourcore_cds/phase1/rectify.py b/src/armourcore_cds/phase1/rectify.py
+index 93f3100..d5ef732 100644
+--- a/src/armourcore_cds/phase1/rectify.py
++++ b/src/armourcore_cds/phase1/rectify.py
+@@ -1,2 +1,46 @@
+-"""Phase 1 module: rectify"""
+ from __future__ import annotations
++
++from dataclasses import dataclass
++
++import cv2
++import numpy as np
++
++
++@dataclass
++class RectifyResult:
++    image: np.ndarray
++    transform_matrix: np.ndarray
++    rectified_size_px: tuple[int, int]
++
++
++def _target_size_from_corners(corners: np.ndarray, expected_aspect_ratio: float) -> tuple[int, int]:
++    tl, tr, br, bl = corners.astype(np.float32)
++    width_a = np.linalg.norm(br - bl)
++    width_b = np.linalg.norm(tr - tl)
++    height_a = np.linalg.norm(tr - br)
++    height_b = np.linalg.norm(tl - bl)
++
++    measured_w = max(width_a, width_b, 1.0)
++    measured_h = max(height_a, height_b, 1.0)
++
++    if measured_w / measured_h > expected_aspect_ratio:
++        target_w = int(round(measured_w))
++        target_h = int(round(target_w / expected_aspect_ratio))
++    else:
++        target_h = int(round(measured_h))
++        target_w = int(round(target_h * expected_aspect_ratio))
++
++    target_w = max(target_w, 64)
++    target_h = max(target_h, 64)
++    return target_w, target_h
++
++
++def rectify_from_corners(image: np.ndarray, corners: np.ndarray, expected_aspect_ratio: float) -> RectifyResult:
++    target_w, target_h = _target_size_from_corners(corners, expected_aspect_ratio)
++    dst = np.array(
++        [[0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]],
++        dtype=np.float32,
++    )
++    matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
++    rectified = cv2.warpPerspective(image, matrix, (target_w, target_h), flags=cv2.INTER_CUBIC)
++    return RectifyResult(image=rectified, transform_matrix=matrix, rectified_size_px=(target_w, target_h))
+diff --git a/src/armourcore_cds/phase1/scaling.py b/src/armourcore_cds/phase1/scaling.py
+index 3286384..cd1233a 100644
+--- a/src/armourcore_cds/phase1/scaling.py
++++ b/src/armourcore_cds/phase1/scaling.py
+@@ -1,2 +1,37 @@
+-"""Phase 1 module: scaling"""
+ from __future__ import annotations
++
++from dataclasses import dataclass
++
++import cv2
++import numpy as np
++
++from armourcore_cds.templates.calibration import mm_to_pixels
++
++
++@dataclass
++class ScalingResult:
++    image: np.ndarray
++    output_size_px: tuple[int, int]
++    px_per_mm_x: float
++    px_per_mm_y: float
++    effective_dpi_x: float
++    effective_dpi_y: float
++
++
++def scale_to_template_design_area(image: np.ndarray, width_mm: float, height_mm: float, output_dpi: int) -> ScalingResult:
++    target_w = max(1, int(round(mm_to_pixels(width_mm, output_dpi))))
++    target_h = max(1, int(round(mm_to_pixels(height_mm, output_dpi))))
++    scaled = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
++
++    px_per_mm_x = target_w / float(width_mm)
++    px_per_mm_y = target_h / float(height_mm)
++    effective_dpi_x = px_per_mm_x * 25.4
++    effective_dpi_y = px_per_mm_y * 25.4
++    return ScalingResult(
++        image=scaled,
++        output_size_px=(target_w, target_h),
++        px_per_mm_x=px_per_mm_x,
++        px_per_mm_y=px_per_mm_y,
++        effective_dpi_x=effective_dpi_x,
++        effective_dpi_y=effective_dpi_y,
++    )
+diff --git a/src/armourcore_cds/templates/models.py b/src/armourcore_cds/templates/models.py
+index d05c970..9c4607f 100644
+--- a/src/armourcore_cds/templates/models.py
++++ b/src/armourcore_cds/templates/models.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from pydantic import BaseModel
++from pydantic import BaseModel, ConfigDict
+ 
+ 
+ class DesignArea(BaseModel):
+@@ -9,6 +9,8 @@ class DesignArea(BaseModel):
+ 
+ 
+ class TemplateModel(BaseModel):
++    model_config = ConfigDict(extra='ignore')
++
+     template_id: str
+     display_name: str
+     design_area_mm: DesignArea
+diff --git a/src/armourcore_cds/utils/debug.py b/src/armourcore_cds/utils/debug.py
+index 036d043..638a828 100644
+--- a/src/armourcore_cds/utils/debug.py
++++ b/src/armourcore_cds/utils/debug.py
+@@ -1,2 +1,32 @@
+-"""Utility module: debug"""
+ from __future__ import annotations
++
++from pathlib import Path
++
++import cv2
++import numpy as np
++
++from armourcore_cds.utils.image_ops import ensure_uint8_bgr, save_image
++
++
++class DebugWriter:
++    def __init__(self, debug_dir: Path, enabled: bool = True) -> None:
++        self.debug_dir = debug_dir
++        self.enabled = enabled
++        if self.enabled:
++            self.debug_dir.mkdir(parents=True, exist_ok=True)
++
++    def image(self, name: str, image: np.ndarray) -> Path | None:
++        if not self.enabled:
++            return None
++        path = self.debug_dir / f'{name}.png'
++        save_image(path, image)
++        return path
++
++    def text_overlay(self, image: np.ndarray, lines: list[str]) -> np.ndarray:
++        canvas = ensure_uint8_bgr(image).copy()
++        y = 30
++        for line in lines:
++            cv2.putText(canvas, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
++            cv2.putText(canvas, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
++            y += 30
++        return canvas
+diff --git a/src/armourcore_cds/utils/image_ops.py b/src/armourcore_cds/utils/image_ops.py
+index df0758a..3179f81 100644
+--- a/src/armourcore_cds/utils/image_ops.py
++++ b/src/armourcore_cds/utils/image_ops.py
+@@ -1,2 +1,55 @@
+-"""Utility module: image_ops"""
+ from __future__ import annotations
++
++from pathlib import Path
++
++import cv2
++import numpy as np
++
++
++def ensure_uint8_bgr(image: np.ndarray) -> np.ndarray:
++    if image.dtype != np.uint8:
++        image = np.clip(image, 0, 255).astype(np.uint8)
++    if image.ndim == 2:
++        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
++    return image
++
++
++def to_gray(image: np.ndarray) -> np.ndarray:
++    if image.ndim == 2:
++        return image
++    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
++
++
++def resize_long_edge(image: np.ndarray, max_long_edge: int) -> np.ndarray:
++    h, w = image.shape[:2]
++    long_edge = max(h, w)
++    if long_edge <= max_long_edge:
++        return image.copy()
++    scale = max_long_edge / float(long_edge)
++    new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
++    return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
++
++
++def save_image(path: Path, image: np.ndarray) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    image = ensure_uint8_bgr(image)
++    ok = cv2.imwrite(str(path), image)
++    if not ok:
++        raise IOError(f'Failed to write image: {path}')
++
++
++def draw_polygon(image: np.ndarray, points: np.ndarray, colour: tuple[int, int, int], thickness: int = 3) -> np.ndarray:
++    canvas = ensure_uint8_bgr(image).copy()
++    pts = points.astype(np.int32).reshape((-1, 1, 2))
++    cv2.polylines(canvas, [pts], isClosed=True, color=colour, thickness=thickness, lineType=cv2.LINE_AA)
++    return canvas
++
++
++def stack_debug_h(a: np.ndarray, b: np.ndarray) -> np.ndarray:
++    a = ensure_uint8_bgr(a)
++    b = ensure_uint8_bgr(b)
++    if a.shape[0] != b.shape[0]:
++        target_h = min(a.shape[0], b.shape[0])
++        a = cv2.resize(a, (int(round(a.shape[1] * target_h / a.shape[0])), target_h), interpolation=cv2.INTER_AREA)
++        b = cv2.resize(b, (int(round(b.shape[1] * target_h / b.shape[0])), target_h), interpolation=cv2.INTER_AREA)
++    return np.hstack([a, b])
+diff --git a/tests/test_boundary_detection.py b/tests/test_boundary_detection.py
+index 3ada1ee..4019d5f 100644
+--- a/tests/test_boundary_detection.py
++++ b/tests/test_boundary_detection.py
+@@ -1,2 +1,14 @@
+-def test_placeholder():
+-    assert True
++import numpy as np
++import cv2
++
++from armourcore_cds.phase1.boundary_detection import detect_outer_border
++
++
++def test_detect_outer_border_on_synthetic_sheet():
++    image = np.full((900, 1200, 3), 255, dtype=np.uint8)
++    pts = np.array([[150, 120], [1050, 160], [980, 760], [180, 720]], dtype=np.int32)
++    cv2.polylines(image, [pts.reshape(-1, 1, 2)], isClosed=True, color=(0, 0, 0), thickness=18)
++
++    result = detect_outer_border(image, expected_aspect_ratio=500 / 600)
++    assert result.ordered_corners.shape == (4, 2)
++    assert result.score > 0
+diff --git a/tests/test_scaling.py b/tests/test_scaling.py
+index d1c425b..2e23258 100644
+--- a/tests/test_scaling.py
++++ b/tests/test_scaling.py
+@@ -1,5 +1,14 @@
++from armourcore_cds.phase1.scaling import scale_to_template_design_area
+ from armourcore_cds.templates.calibration import mm_to_pixels
++import numpy as np
+ 
+ 
+ def test_mm_to_pixels_positive():
+     assert mm_to_pixels(25.4, 400) == 400
++
++
++def test_scale_to_template_design_area_shape():
++    image = np.zeros((100, 200, 3), dtype=np.uint8)
++    result = scale_to_template_design_area(image, width_mm=50, height_mm=25, output_dpi=254)
++    assert result.output_size_px == (500, 250)
++    assert result.image.shape[:2] == (250, 500)
+diff --git a/tests/test_template_registry.py b/tests/test_template_registry.py
+index 8517287..78001dd 100644
+--- a/tests/test_template_registry.py
++++ b/tests/test_template_registry.py
+@@ -2,6 +2,12 @@ from armourcore_cds.templates.registry import load_template_config
+ 
+ 
+ def test_regular_template_loads():
+-    template = load_template_config("cds_regular_500x600")
++    template = load_template_config('cds_regular_500x600')
+     assert template.design_area_mm.width == 500
+     assert template.design_area_mm.height == 600
++
++
++def test_xlarge_template_loads():
++    template = load_template_config('cds_xlarge_500x900')
++    assert template.design_area_mm.width == 500
++    assert template.design_area_mm.height == 900
