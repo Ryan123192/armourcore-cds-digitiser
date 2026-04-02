@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "armourcore-cds-digitiser"
+version = "0.1.0"
+description = "Phase-based tooling for rectifying and digitising ArmourCore calibrated design sheets."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python>=4.10.0",
+    "numpy>=2.0.0",
+    "Pillow>=10.4.0",
+    "PyYAML>=6.0.2",
+    "pydantic>=2.8.0",
+    "pymupdf>=1.24.0",
+    "scikit-image>=0.24.0",
+    "ezdxf>=1.3.0",
+]
+
+[project.scripts]
+armourcore-cds = "armourcore_cds.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

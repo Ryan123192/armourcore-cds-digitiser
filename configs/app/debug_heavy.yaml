@@ -1,0 +1,22 @@
+app_name: armourcore-cds-digitiser
+mode: development_debug
+log_level: DEBUG
+
+output:
+  base_dir: outputs/runs
+  timestamp_runs: true
+  write_debug_images: true
+  write_summary_text: true
+  write_run_report: true
+
+processing:
+  default_template: cds_regular_500x600
+  preferred_output_dpi: 400
+  preserve_customer_dark_marks: true
+  single_file_mode: true
+
+debug:
+  save_border_candidates: true
+  save_mask_previews: true
+  save_warp_overlays: true
+  save_crop_overlays: true
