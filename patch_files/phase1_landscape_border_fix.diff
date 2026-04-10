@@ -1,0 +1,365 @@
+diff --git a/configs/templates/cds_xlarge_500x900.yaml b/configs/templates/cds_xlarge_500x900.yaml
+--- a/configs/templates/cds_xlarge_500x900.yaml
++++ b/configs/templates/cds_xlarge_500x900.yaml
+@@ -1,8 +1,8 @@
+ template_id: cds_xlarge_500x900
+ display_name: cds_xlarge_500x900
+ design_area_mm:
+-  width: 500
+-  height: 900
++  width: 900
++  height: 500
+ crop_rule: inside_most_edge_of_thick_outer_border
+ preferred_output_dpi: 400
+ primary_geometry_truth: outer_border
+diff --git a/src/armourcore_cds/phase1/boundary_detection.py b/src/armourcore_cds/phase1/boundary_detection.py
+--- a/src/armourcore_cds/phase1/boundary_detection.py
++++ b/src/armourcore_cds/phase1/boundary_detection.py
+@@ -1,114 +1,155 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-from typing import Any
+ 
+ import cv2
+ import numpy as np
+ 
+ from armourcore_cds.utils.image_ops import to_gray
+ 
+ 
+ @dataclass
+ class BorderDetectionResult:
+     contour: np.ndarray
+     ordered_corners: np.ndarray
+     preview_edges: np.ndarray
+     preview_mask: np.ndarray
+     contour_area_px: float
+     score: float
+     candidate_count: int
+ 
+ 
+ def _order_points_clockwise(points: np.ndarray) -> np.ndarray:
+     pts = points.astype(np.float32)
+     s = pts.sum(axis=1)
+     diff = np.diff(pts, axis=1).reshape(-1)
+     ordered = np.zeros((4, 2), dtype=np.float32)
+     ordered[0] = pts[np.argmin(s)]      # top-left
+     ordered[2] = pts[np.argmax(s)]      # bottom-right
+     ordered[1] = pts[np.argmin(diff)]   # top-right
+     ordered[3] = pts[np.argmax(diff)]   # bottom-left
+     return ordered
+ 
+ 
+-def _contour_score(contour: np.ndarray, image_shape: tuple[int, int], expected_aspect_ratio: float) -> tuple[float, np.ndarray] | None:
++def _edge_dark_ratio(gray: np.ndarray, rect: np.ndarray) -> float:
++    mask = np.zeros_like(gray)
++    thickness = max(3, int(round(min(gray.shape[:2]) * 0.0045)))
++    cv2.polylines(mask, [rect.astype(np.int32)], isClosed=True, color=255, thickness=thickness)
++    pixels = gray[mask > 0]
++    if pixels.size == 0:
++        return 0.0
++    dark_threshold = float(np.percentile(gray, 35))
++    return float(np.mean(pixels <= dark_threshold))
++
++
++def _contour_score(contour: np.ndarray, image_shape: tuple[int, int], expected_aspect_ratio: float, gray: np.ndarray) -> tuple[float, np.ndarray] | None:
+     perimeter = cv2.arcLength(contour, True)
+     if perimeter <= 0:
+         return None
+ 
+-    approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
++    approx = cv2.approxPolyDP(contour, 0.015 * perimeter, True)
+     if len(approx) != 4 or not cv2.isContourConvex(approx):
+         return None
+ 
+     area = cv2.contourArea(approx)
+     if area <= 0:
+         return None
+@@ -28,7 +69,7 @@ def _contour_score(contour: np.ndarray, image_shape: tuple[int, int], expected_a
+ 
+     h, w = image_shape[:2]
+     image_area = float(h * w)
+     area_ratio = area / image_area
+-    if area_ratio < 0.12:
++    if area_ratio < 0.08:
+         return None
+ 
+     rect = _order_points_clockwise(approx.reshape(4, 2))
+     top_w = float(np.linalg.norm(rect[1] - rect[0]))
+@@ -42,6 +83,8 @@ def _contour_score(contour: np.ndarray, image_shape: tuple[int, int], expected_a
+     aspect_ratio = mean_w / mean_h
+     aspect_error = abs(np.log(aspect_ratio / expected_aspect_ratio))
+ 
++    dark_ratio = _edge_dark_ratio(gray, rect)
++
+     contour_pts = approx.reshape(4, 2).astype(np.float32)
+     contour_center = contour_pts.mean(axis=0)
+     image_center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+@@ -49,15 +92,26 @@ def _contour_score(contour: np.ndarray, image_shape: tuple[int, int], expected_a
+     max_centre_distance = float(np.linalg.norm(image_center))
+     centre_penalty = centre_distance / max(max_centre_distance, 1.0)
+ 
+-    extent = area / max(cv2.contourArea(cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.float32)), 1.0)
+-    score = (area_ratio * 4.0) + (extent * 1.5) - (aspect_error * 2.5) - (centre_penalty * 0.5)
++    min_rect = cv2.minAreaRect(contour)
++    box_area = max(cv2.contourArea(cv2.boxPoints(min_rect).astype(np.float32)), 1.0)
++    extent = area / box_area
++
++    x, y, bw, bh = cv2.boundingRect(approx)
++    margin = max(6, int(round(min(h, w) * 0.01)))
++    touches_image_edge = x <= margin or y <= margin or (x + bw) >= (w - margin) or (y + bh) >= (h - margin)
++    edge_touch_penalty = 0.25 if touches_image_edge else 0.0
++
++    score = (
++        (area_ratio * 3.0)
++        + (extent * 1.0)
++        + (dark_ratio * 2.5)
++        - (aspect_error * 3.5)
++        - (centre_penalty * 0.4)
++        - edge_touch_penalty
++    )
+     return score, rect
+ 
+ 
+ def detect_outer_border(image: np.ndarray, expected_aspect_ratio: float) -> BorderDetectionResult:
+     gray = to_gray(image)
+-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
++    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+ 
+     edges = cv2.Canny(blur, 50, 150)
+     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+     dilated = cv2.dilate(closed, kernel, iterations=1)
+ 
+-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
++    contours, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+     best_score = None
+     best_rect = None
+     best_contour = None
+ 
+     for contour in contours:
+-        scored = _contour_score(contour, image.shape, expected_aspect_ratio)
++        scored = _contour_score(contour, image.shape, expected_aspect_ratio, gray)
+         if scored is None:
+             continue
+         score, rect = scored
+         if best_score is None or score > best_score:
+             best_score = score
+@@ -67,7 +121,7 @@ def detect_outer_border(image: np.ndarray, expected_aspect_ratio: float) -> Bord
+     if best_rect is None or best_contour is None or best_score is None:
+         raise RuntimeError('Could not detect CDS outer border candidate.')
+ 
+     mask = np.zeros_like(gray)
+-    cv2.drawContours(mask, [best_contour], -1, 255, thickness=cv2.FILLED)
++    cv2.fillConvexPoly(mask, best_rect.astype(np.int32), 255)
+ 
+     return BorderDetectionResult(
+         contour=best_contour,
+         ordered_corners=best_rect,
+         preview_edges=dilated,
+         preview_mask=mask,
+         contour_area_px=float(cv2.contourArea(best_contour)),
+         score=float(best_score),
+         candidate_count=len(contours),
+     )
+diff --git a/src/armourcore_cds/phase1/crop.py b/src/armourcore_cds/phase1/crop.py
+--- a/src/armourcore_cds/phase1/crop.py
++++ b/src/armourcore_cds/phase1/crop.py
+@@ -1,114 +1,139 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ 
+ import cv2
+ import numpy as np
+ 
+ from armourcore_cds.utils.image_ops import to_gray
+ 
+ 
+ @dataclass
+ class InnerBorderCropResult:
+     cropped_image: np.ndarray
+     inner_rect_xyxy: tuple[int, int, int, int]
+     border_samples_px: dict[str, int]
+     preview_binary: np.ndarray
+ 
+ 
+-def _scan_dark_run(profile: np.ndarray, threshold: int, min_run: int) -> int:
+-    run = 0
+-    start = 0
+-    for idx, value in enumerate(profile):
+-        if value <= threshold:
+-            if run == 0:
+-                start = idx
+-            run += 1
+-            if run >= min_run:
+-                return start
+-        else:
+-            run = 0
+-    return 0
++def _find_peak_run(profile: np.ndarray, prefer_start: bool) -> tuple[int, int]:
++    if profile.size == 0:
++        return 0, 0
+ 
++    threshold = max(float(np.percentile(profile, 92)) * 0.55, 0.10)
++    runs: list[tuple[int, int]] = []
++    in_run = False
++    start = 0
+ 
+-def _scan_dark_run_reverse(profile: np.ndarray, threshold: int, min_run: int) -> int:
+-    run = 0
+-    end = len(profile) - 1
+-    for rev_idx, value in enumerate(profile[::-1]):
+-        idx = len(profile) - 1 - rev_idx
+-        if value <= threshold:
+-            if run == 0:
+-                end = idx
+-            run += 1
+-            if run >= min_run:
+-                return end
++    for idx, value in enumerate(profile):
++        if value >= threshold:
++            if not in_run:
++                start = idx
++                in_run = True
+         else:
+-            run = 0
+-    return len(profile) - 1
++            if in_run:
++                runs.append((start, idx - 1))
++                in_run = False
++
++    if in_run:
++        runs.append((start, len(profile) - 1))
++
++    if not runs:
++        peak = int(np.argmax(profile))
++        return peak, peak
++
++    best_run = runs[0]
++    best_score = float('-inf')
++    length = max(len(profile), 1)
++    for run_start, run_end in runs:
++        run_slice = profile[run_start:run_end + 1]
++        run_strength = float(run_slice.mean())
++        run_len = (run_end - run_start + 1)
++        edge_distance = run_start if prefer_start else (length - 1 - run_end)
++        score = (run_strength * run_len) - ((edge_distance / length) * 0.5)
++        if score > best_score:
++            best_score = score
++            best_run = (run_start, run_end)
++    return best_run
+ 
+ 
+ def find_inner_border_crop(rectified_image: np.ndarray) -> InnerBorderCropResult:
+     gray = to_gray(rectified_image)
+-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+-    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
++    blur = cv2.GaussianBlur(gray, (5, 5), 0)
++    binary = cv2.adaptiveThreshold(
++        blur,
++        255,
++        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
++        cv2.THRESH_BINARY_INV,
++        51,
++        9,
++    )
++    binary = cv2.morphologyEx(
++        binary,
++        cv2.MORPH_CLOSE,
++        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
++        iterations=1,
++    )
+ 
+-    margin_y = max(5, rectified_image.shape[0] // 20)
+-    margin_x = max(5, rectified_image.shape[1] // 20)
++    h, w = rectified_image.shape[:2]
++    search_y = max(20, int(round(h * 0.18)))
++    search_x = max(20, int(round(w * 0.12)))
++
++    centre_x0 = int(round(w * 0.12))
++    centre_x1 = int(round(w * 0.88))
++    centre_y0 = int(round(h * 0.12))
++    centre_y1 = int(round(h * 0.88))
++
++    top_strength = (binary[:search_y, centre_x0:centre_x1] > 0).mean(axis=1)
++    bottom_strength = (binary[h - search_y:, centre_x0:centre_x1] > 0).mean(axis=1)
++    left_strength = (binary[centre_y0:centre_y1, :search_x] > 0).mean(axis=0)
++    right_strength = (binary[centre_y0:centre_y1, w - search_x:] > 0).mean(axis=0)
++
++    top_start, top_end = _find_peak_run(top_strength, prefer_start=True)
++    bottom_start, bottom_end = _find_peak_run(bottom_strength, prefer_start=False)
++    left_start, left_end = _find_peak_run(left_strength, prefer_start=True)
++    right_start, right_end = _find_peak_run(right_strength, prefer_start=False)
++
++    y0 = int(np.clip(top_end + 1, 0, h - 2))
++    y1 = int(np.clip((h - search_y) + bottom_start - 1, y0 + 1, h - 1))
++    x0 = int(np.clip(left_end + 1, 0, w - 2))
++    x1 = int(np.clip((w - search_x) + right_start - 1, x0 + 1, w - 1))
+ 
+-    top_band = blur[:margin_y, :]
+-    bottom_band = blur[-margin_y:, :]
+-    left_band = blur[:, :margin_x]
+-    right_band = blur[:, -margin_x:]
+-
+-    top_profile = top_band.mean(axis=1)
+-    bottom_profile = bottom_band.mean(axis=1)
+-    left_profile = left_band.mean(axis=0)
+-    right_profile = right_band.mean(axis=0)
+-
+-    threshold = int(np.clip(np.percentile(np.concatenate([top_profile, bottom_profile, left_profile, right_profile]), 35), 30, 220))
+-    min_run_y = max(3, margin_y // 6)
+-    min_run_x = max(3, margin_x // 6)
+-
+-    top_outer = _scan_dark_run(top_profile, threshold, min_run_y)
+-    bottom_outer_local = _scan_dark_run_reverse(bottom_profile, threshold, min_run_y)
+-    left_outer = _scan_dark_run(left_profile, threshold, min_run_x)
+-    right_outer_local = _scan_dark_run_reverse(right_profile, threshold, min_run_x)
+-
+-    top_band_dark = top_profile <= threshold
+-    left_band_dark = left_profile <= threshold
+-    bottom_band_dark = bottom_profile <= threshold
+-    right_band_dark = right_profile <= threshold
+-
+-    top_inner = top_outer
+-    while top_inner < len(top_band_dark) and top_band_dark[top_inner]:
+-        top_inner += 1
+-
+-    left_inner = left_outer
+-    while left_inner < len(left_band_dark) and left_band_dark[left_inner]:
+-        left_inner += 1
+-
+-    bottom_inner_local = bottom_outer_local
+-    while bottom_inner_local >= 0 and bottom_band_dark[bottom_inner_local]:
+-        bottom_inner_local -= 1
+-
+-    right_inner_local = right_outer_local
+-    while right_inner_local >= 0 and right_band_dark[right_inner_local]:
+-        right_inner_local -= 1
+-
+-    x0 = int(np.clip(left_inner, 0, rectified_image.shape[1] - 2))
+-    y0 = int(np.clip(top_inner, 0, rectified_image.shape[0] - 2))
+-    x1 = int(np.clip(rectified_image.shape[1] - margin_x + right_inner_local, x0 + 1, rectified_image.shape[1] - 1))
+-    y1 = int(np.clip(rectified_image.shape[0] - margin_y + bottom_inner_local, y0 + 1, rectified_image.shape[0] - 1))
++    if (x1 - x0) < (w * 0.50) or (y1 - y0) < (h * 0.50):
++        fallback_pad_x = max(2, int(round(w * 0.01)))
++        fallback_pad_y = max(2, int(round(h * 0.01)))
++        x0 = fallback_pad_x
++        x1 = w - fallback_pad_x
++        y0 = fallback_pad_y
++        y1 = h - fallback_pad_y
+ 
+     cropped = rectified_image[y0:y1, x0:x1].copy()
+     return InnerBorderCropResult(
+         cropped_image=cropped,
+         inner_rect_xyxy=(x0, y0, x1, y1),
+         border_samples_px={
+             'top': int(y0),
+-            'bottom': int(rectified_image.shape[0] - y1),
++            'bottom': int(h - y1),
+             'left': int(x0),
+-            'right': int(rectified_image.shape[1] - x1),
++            'right': int(w - x1),
+         },
+         preview_binary=binary,
+     )

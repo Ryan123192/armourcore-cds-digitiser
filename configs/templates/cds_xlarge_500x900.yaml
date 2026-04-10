@@ -1,8 +1,8 @@
 template_id: cds_xlarge_500x900
 display_name: cds_xlarge_500x900
 design_area_mm:
-  width: 500
-  height: 900
+  width: 900
+  height: 500
 crop_rule: inside_most_edge_of_thick_outer_border
 preferred_output_dpi: 400
 primary_geometry_truth: outer_border

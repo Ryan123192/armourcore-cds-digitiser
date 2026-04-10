@@ -40,7 +40,7 @@ def save_image(path: Path, image: np.ndarray) -> None:
 
 def draw_polygon(image: np.ndarray, points: np.ndarray, colour: tuple[int, int, int], thickness: int = 3) -> np.ndarray:
     canvas = ensure_uint8_bgr(image).copy()
-    pts = points.astype(np.int32).reshape((-1, 1, 2))
+    pts = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
     cv2.polylines(canvas, [pts], isClosed=True, color=colour, thickness=thickness, lineType=cv2.LINE_AA)
     return canvas
 

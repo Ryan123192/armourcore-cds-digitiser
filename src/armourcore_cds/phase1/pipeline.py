@@ -1,21 +1,27 @@
+"""Phase 1 pipeline implementation."""
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 import yaml
 
 from armourcore_cds.io.loaders import load_input
 from armourcore_cds.io.run_report import write_run_report
 from armourcore_cds.io.save import ensure_run_dir
 from armourcore_cds.phase1.boundary_detection import detect_outer_border
-from armourcore_cds.phase1.crop import find_inner_border_crop
 from armourcore_cds.phase1.rectify import rectify_from_corners
 from armourcore_cds.phase1.scaling import scale_to_template_design_area
 from armourcore_cds.templates.registry import load_template_config
 from armourcore_cds.utils.debug import DebugWriter
-from armourcore_cds.utils.image_ops import draw_polygon, resize_long_edge, stack_debug_h, to_gray, save_image
+from armourcore_cds.utils.image_ops import draw_polygon, resize_long_edge, stack_debug_h, save_image
+
+
+def _corners_to_serialisable(corners: object) -> list[list[float]]:
+    arr = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    return [[round(float(x), 2), round(float(y), 2)] for x, y in arr.tolist()]
 
 
 def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -> Path:
@@ -35,43 +41,43 @@ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -
     expected_aspect_ratio = float(template.design_area_mm.width) / float(template.design_area_mm.height)
     border = detect_outer_border(input_image, expected_aspect_ratio=expected_aspect_ratio)
 
-    contour_overlay = draw_polygon(input_image, border.ordered_corners, (0, 255, 0), thickness=6)
-    debug.image('02_border_edges', cv2.cvtColor(border.preview_edges, cv2.COLOR_GRAY2BGR))
-    debug.image('03_border_mask', cv2.cvtColor(border.preview_mask, cv2.COLOR_GRAY2BGR))
+    contour_overlay = draw_polygon(input_image, border.ordered_corners_xy, (0, 255, 0), thickness=6)
     debug.image('04_border_detected', contour_overlay)
 
-    rectified = rectify_from_corners(input_image, border.ordered_corners, expected_aspect_ratio=expected_aspect_ratio)
+    rectified = rectify_from_corners(input_image, border.ordered_corners_xy, expected_aspect_ratio=expected_aspect_ratio)
     debug.image('05_rectified_outer', rectified.image)
 
-    crop_result = find_inner_border_crop(rectified.image)
-    crop_preview = rectified.image.copy()
-    x0, y0, x1, y1 = crop_result.inner_rect_xyxy
-    cv2.rectangle(crop_preview, (x0, y0), (x1, y1), (0, 255, 0), 4)
-    debug.image('06_inner_border_binary', cv2.cvtColor(crop_result.preview_binary, cv2.COLOR_GRAY2BGR))
-    debug.image('07_inner_crop_preview', crop_preview)
-    debug.image('08_cropped_design_area_raw', crop_result.cropped_image)
+    design_area_preview = rectified.image.copy()
+    h, w = design_area_preview.shape[:2]
+    cv2.rectangle(design_area_preview, (0, 0), (w - 1, h - 1), (0, 255, 0), 4)
+    debug.image('06_design_area_preview', design_area_preview)
+    debug.image('07_design_area_raw', rectified.image)
 
     scaled = scale_to_template_design_area(
-        crop_result.cropped_image,
+        rectified.image,
         width_mm=template.design_area_mm.width,
         height_mm=template.design_area_mm.height,
         output_dpi=preferred_output_dpi,
     )
-    debug.image('09_scaled_design_area', scaled.image)
+    debug.image('08_scaled_design_area', scaled.image)
 
     save_image(run_dir / 'rectified_outer.png', rectified.image)
-    save_image(run_dir / 'cropped_design_area_raw.png', crop_result.cropped_image)
+    save_image(run_dir / 'cropped_design_area_raw.png', rectified.image)
     save_image(run_dir / 'scaled_design_area.png', scaled.image)
 
     summary_preview = stack_debug_h(
         resize_long_edge(contour_overlay, 1400),
-        resize_long_edge(crop_preview, 1400),
+        resize_long_edge(design_area_preview, 1400),
     )
-    summary_preview = debug.text_overlay(summary_preview, [
+    summary_lines = [
         f'template={template.template_id}',
         f'input={input_meta["input_kind"]}',
+        'crop_mode=none_use_detected_border',
+        f'border_confidence={border.confidence}',
+        f'border_score={border.score:.3f}',
         f'output_px={scaled.output_size_px[0]}x{scaled.output_size_px[1]}',
-    ])
+    ]
+    summary_preview = debug.text_overlay(summary_preview, summary_lines)
     debug.image('10_summary_preview', summary_preview)
 
     report = {
@@ -90,23 +96,31 @@ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -
             'height': template.design_area_mm.height,
         },
         'border_detection': {
-            'ordered_corners_xy': border.ordered_corners.round(2).tolist(),
-            'contour_area_px': border.contour_area_px,
-            'score': border.score,
-            'candidate_count': border.candidate_count,
+            'ordered_corners_xy': _corners_to_serialisable(border.ordered_corners_xy),
+            'contour_area_px': float(border.contour_area_px),
+            'score': float(border.score),
+            'candidate_count': int(border.candidate_count),
+            'confidence': border.confidence,
+            'diagnostics': border.diagnostics or {},
         },
         'rectification': {
             'rectified_outer_size_px': {
                 'width': rectified.rectified_size_px[0],
                 'height': rectified.rectified_size_px[1],
             },
-            'inner_crop_xyxy_px': {
-                'x0': x0,
-                'y0': y0,
-                'x1': x1,
-                'y1': y1,
+            'crop_mode': 'none_use_detected_border',
+            'design_area_xyxy_px': {
+                'x0': 0,
+                'y0': 0,
+                'x1': rectified.rectified_size_px[0] - 1,
+                'y1': rectified.rectified_size_px[1] - 1,
             },
-            'inner_border_margins_px': crop_result.border_samples_px,
+            'design_area_margins_px': {
+                'top': 0,
+                'bottom': 0,
+                'left': 0,
+                'right': 0,
+            },
         },
         'scaling': {
             'output_dpi': preferred_output_dpi,
@@ -126,9 +140,9 @@ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -
             'debug_dir': 'debug',
         },
         'assumptions': [
-            'The strongest external quadrilateral contour corresponds to the CDS outer border.',
-            'The inside-most edge of the thick border can be recovered after rectification by scanning inward from each edge.',
-            'This first pass prioritises deterministic geometry recovery, not artefact suppression or trace extraction.',
+            'The detected thick-border quadrilateral is the geometry truth for rectification, crop and scale.',
+            'Calibration squares are support features for border confidence only and do not define the output crop.',
+            'Phase 01 intentionally skips any secondary crop to avoid locking onto customer-drawn geometry.',
         ],
     }
     write_run_report(run_dir / 'run_report.json', report)

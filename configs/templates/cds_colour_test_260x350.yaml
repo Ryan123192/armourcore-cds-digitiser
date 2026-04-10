@@ -1,8 +1,8 @@
 template_id: cds_colour_test_260x350
 display_name: cds_colour_test_260x350
 design_area_mm:
-  width: 260
-  height: 350
+  width: 350
+  height: 260
 crop_rule: inside_most_edge_of_thick_outer_border
 preferred_output_dpi: 400
 primary_geometry_truth: outer_border

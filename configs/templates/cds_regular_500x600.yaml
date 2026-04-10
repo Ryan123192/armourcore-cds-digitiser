@@ -1,8 +1,8 @@
 template_id: cds_regular_500x600
 display_name: cds_regular_500x600
 design_area_mm:
-  width: 500
-  height: 600
+  width: 600
+  height: 500
 crop_rule: inside_most_edge_of_thick_outer_border
 preferred_output_dpi: 400
 primary_geometry_truth: outer_border
