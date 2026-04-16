@@ -14,7 +14,6 @@ processing:
   preferred_output_dpi: 400
   border_colour_mode_override: null
   orange_border_hex: "#D35400"
-  blue_border_hex: "#00CAEC"
   preserve_customer_dark_marks: true
   single_file_mode: true
 

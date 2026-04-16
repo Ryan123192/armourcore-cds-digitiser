@@ -29,7 +29,7 @@ def _normalise_mode(value: object) -> str | None:
     if value is None:
         return None
     mode = str(value).strip().lower()
-    if mode in {"auto", "black", "orange", "blue"}:
+    if mode in {"auto", "black", "orange"}:
         return mode
     return None
 
@@ -65,7 +65,6 @@ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -
     outer_border_hex_candidates = list(getattr(template_colour_hints, "outer_border_hex_candidates", []) or [])
     fiducial_hex_candidates = list(getattr(template_colour_hints, "fiducial_hex_candidates", []) or [])
     orange_border_hex = str(processing_cfg.get("orange_border_hex", "#D35400")).strip()
-    blue_border_hex = str(processing_cfg.get("blue_border_hex", "#00CAEC")).strip()
 
     border = detect_outer_border(
         input_image,
@@ -77,7 +76,6 @@ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -
         fiducial_hex_candidates=fiducial_hex_candidates,
         border_colour_mode=resolved_border_mode,
         orange_border_hex=orange_border_hex,
-        blue_border_hex=blue_border_hex,
     )
 
     contour_overlay = draw_polygon(input_image, border.ordered_corners_xy, (0, 255, 0), thickness=6)

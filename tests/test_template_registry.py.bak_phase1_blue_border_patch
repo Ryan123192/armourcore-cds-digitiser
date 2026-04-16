@@ -20,7 +20,7 @@ def test_xlarge_template_loads():
 def test_colour_template_loads_nested_colour_hints():
     template = load_template_config("cds_colour_test_260x350")
     assert template.border_detection is not None
-    assert template.border_detection.border_colour_mode == "blue"
+    assert template.border_detection.border_colour_mode == "orange"
     assert template.border_detection.colour_hints is not None
-    assert "#00CAEC" in template.border_detection.colour_hints.outer_border_hex_candidates
+    assert "#D35400" in template.border_detection.colour_hints.outer_border_hex_candidates
     assert "#FF0000" in template.border_detection.colour_hints.fiducial_hex_candidates

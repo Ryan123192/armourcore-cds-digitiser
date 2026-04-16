@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import BaseModel, ConfigDict, Field
-
-
-BorderColourMode = Literal["auto", "black", "orange", "blue"]
 
 
 class DesignArea(BaseModel):
@@ -24,7 +19,6 @@ class ColourHintsModel(BaseModel):
 
 
 class BorderDetectionModel(BaseModel):
-    border_colour_mode: BorderColourMode | None = None
     use_colour_hint: bool | None = None
     use_shape_constraints: bool | None = None
     fallback_to_fiducials: bool | None = None
@@ -48,6 +42,7 @@ class TemplateModel(BaseModel):
     preferred_output_dpi: int
     primary_geometry_truth: str
     fiducials_enabled: bool
+
     grid: GridModel | None = None
     border_detection: BorderDetectionModel | None = None
     outputs: TemplateOutputsModel | None = None

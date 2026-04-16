@@ -1,28 +1,22 @@
 template_id: cds_colour_test_260x350
 display_name: cds_colour_test_260x350
-
 design_area_mm:
   width: 350
   height: 260
-
 crop_rule: inside_most_edge_of_thick_outer_border
 preferred_output_dpi: 400
 primary_geometry_truth: outer_border
 fiducials_enabled: true
-
 grid:
   minor_spacing_mm: 10
   major_spacing_mm: 50
-
 border_detection:
-  border_colour_mode: blue
   use_colour_hint: true
   use_shape_constraints: true
   fallback_to_fiducials: true
-  colour_hints:
-    outer_border_hex_candidates: ["#00CAEC"]
-    fiducial_hex_candidates: ["#FF0000"]
-
+colour_hints:
+  outer_border_hex_candidates: ["#C2185B", "#007C91", "#D35400", "#2E7D32"]
+  fiducial_hex_candidates: ["#FF0000"]
 outputs:
   write_rectified: true
   write_scaled: true

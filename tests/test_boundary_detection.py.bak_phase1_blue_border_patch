@@ -47,28 +47,3 @@ def test_detect_outer_border_on_synthetic_orange_sheet():
     assert result.diagnostics["detected_border_mode"] == "orange"
     assert result.diagnostics["colour_score"] >= 0.12
     assert result.diagnostics["orange_band_width_score"] >= 0.08
-
-
-def test_detect_outer_border_on_synthetic_blue_sheet():
-    image = np.full((900, 1200, 3), 255, dtype=np.uint8)
-    outer = np.array([[120, 110], [1080, 110], [1070, 790], [130, 790]], dtype=np.int32)
-    inner = np.array([[240, 210], [970, 220], [950, 690], [250, 680]], dtype=np.int32)
-    blue_bgr = (236, 202, 0)  # #00CAEC in BGR
-
-    cv2.polylines(image, [outer.reshape(-1, 1, 2)], isClosed=True, color=blue_bgr, thickness=20)
-    cv2.polylines(image, [inner.reshape(-1, 1, 2)], isClosed=True, color=blue_bgr, thickness=4)
-
-    result = detect_outer_border(
-        image,
-        expected_aspect_ratio=350 / 260,
-        border_colour_mode="blue",
-        outer_border_hex_candidates=["#00CAEC"],
-        blue_border_hex="#00CAEC",
-    )
-
-    assert len(result.ordered_corners_xy) == 4
-    assert result.candidate_count > 0
-    assert result.score > 0
-    assert result.diagnostics["detected_border_mode"] == "blue"
-    assert result.diagnostics["colour_score"] >= 0.12
-    assert result.diagnostics["blue_band_width_score"] >= 0.08

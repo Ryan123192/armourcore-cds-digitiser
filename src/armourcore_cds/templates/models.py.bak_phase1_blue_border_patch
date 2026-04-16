@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-BorderColourMode = Literal["auto", "black", "orange", "blue"]
+BorderColourMode = Literal["auto", "black", "orange"]
 
 
 class DesignArea(BaseModel):

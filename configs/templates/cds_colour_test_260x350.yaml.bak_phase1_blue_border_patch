@@ -15,12 +15,12 @@ grid:
   major_spacing_mm: 50
 
 border_detection:
-  border_colour_mode: blue
+  border_colour_mode: orange
   use_colour_hint: true
   use_shape_constraints: true
   fallback_to_fiducials: true
   colour_hints:
-    outer_border_hex_candidates: ["#00CAEC"]
+    outer_border_hex_candidates: ["#D35400"]
     fiducial_hex_candidates: ["#FF0000"]
 
 outputs:

@@ -283,60 +283,6 @@ def _make_orange_border_mask(
     return border_mask
 
 
-def _make_blue_mask(
-    image_bgr: np.ndarray,
-    outer_border_hex_candidates: list[str] | None,
-    blue_border_hex: str,
-) -> np.ndarray:
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    masks: list[np.ndarray] = []
-
-    if outer_border_hex_candidates:
-        masks.append(_build_colour_mask_from_hex_candidates(image_bgr, list(outer_border_hex_candidates)))
-    else:
-        masks.append(_build_colour_mask_from_hex_candidates(image_bgr, [blue_border_hex]))
-
-    h0, s0, v0 = _hex_to_hsv(blue_border_hex)
-
-    # Nominal configured blue/cyan window.
-    lower1 = np.array([max(0, h0 - 12), max(35, s0 - 145), max(55, v0 - 150)], dtype=np.uint8)
-    upper1 = np.array([min(179, h0 + 12), 255, 255], dtype=np.uint8)
-    masks.append(cv2.inRange(hsv, lower1, upper1))
-
-    # Slightly greener cyan shift under phone white balance / exposure changes.
-    lower2 = np.array([max(0, h0 - 20), 45, 55], dtype=np.uint8)
-    upper2 = np.array([min(179, h0 + 8), 255, 255], dtype=np.uint8)
-    masks.append(cv2.inRange(hsv, lower2, upper2))
-
-    # Washed-out print / glare fallback.
-    lower3 = np.array([max(0, h0 - 14), 18, 85], dtype=np.uint8)
-    upper3 = np.array([min(179, h0 + 16), 180, 255], dtype=np.uint8)
-    masks.append(cv2.inRange(hsv, lower3, upper3))
-
-    # Static cyan-blue guard rails around #00CAEC.
-    lower4 = np.array([78, 35, 60], dtype=np.uint8)
-    upper4 = np.array([110, 255, 255], dtype=np.uint8)
-    masks.append(cv2.inRange(hsv, lower4, upper4))
-
-    mask = _merge_masks(*masks)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
-    return mask
-
-
-def _make_blue_border_mask(
-    image_bgr: np.ndarray,
-    outer_border_hex_candidates: list[str] | None,
-    blue_border_hex: str,
-) -> np.ndarray:
-    blue_mask = _make_blue_mask(image_bgr, outer_border_hex_candidates, blue_border_hex)
-    border_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
-    border_mask = cv2.morphologyEx(border_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
-    border_mask = cv2.dilate(border_mask, np.ones((3, 3), np.uint8), iterations=1)
-    return border_mask
-
-
 def _marker_support_score(image_bgr: np.ndarray, quad: np.ndarray, fiducial_hex_candidates: list[str] | None) -> float:
     if not fiducial_hex_candidates:
         return 0.0
@@ -386,15 +332,15 @@ def _outside_envelope_penalty(gray: np.ndarray, quad: np.ndarray) -> float:
     return float(np.mean(penalties))
 
 
-def _colour_band_width_score(colour_border_mask: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> float:
-    strip = _sample_line_mask(colour_border_mask, p0, p1, half_width=8, samples=192)
+def _orange_band_width_score(orange_border_mask: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> float:
+    strip = _sample_line_mask(orange_border_mask, p0, p1, half_width=8, samples=192)
     row_occupancy = np.mean(strip > 0, axis=1)
     width_frac = float(np.mean(row_occupancy > 0.20))
     return _occupancy_band_score(width_frac, lo=0.08, peak_lo=0.16, peak_hi=0.55, hi=0.90)
 
 
-def _colour_parallel_penalty(colour_mask: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> float:
-    strip = _sample_line_mask(colour_mask, p0, p1, half_width=18, samples=160)
+def _orange_parallel_penalty(orange_mask: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> float:
+    strip = _sample_line_mask(orange_mask, p0, p1, half_width=18, samples=160)
     row_occupancy = np.mean(strip > 0, axis=1)
     centre = row_occupancy.shape[0] // 2
     guard = 4
@@ -415,7 +361,7 @@ def _build_black_candidates(gray: np.ndarray, border_px: int, min_area_px: float
     raw_candidates.extend(_collect_candidate_quads(edges, min_area_px=min_area_px, source="edges"))
     raw_candidates.extend(_collect_candidate_quads(dark_mask, min_area_px=min_area_px, source="dark"))
     raw_candidates.extend(_collect_candidate_quads(combined, min_area_px=min_area_px, source="combined"))
-    return raw_candidates, {"colour_mask": np.zeros_like(edges), "colour_border_mask": np.zeros_like(edges)}
+    return raw_candidates, {"orange_mask": np.zeros_like(edges), "orange_border_mask": np.zeros_like(edges)}
 
 
 def _build_orange_candidates(
@@ -463,56 +409,8 @@ def _build_orange_candidates(
             retrieval_mode=cv2.RETR_EXTERNAL,
         )
     )
-    return raw_candidates, {"colour_mask": orange_mask, "colour_border_mask": orange_border_mask}
+    return raw_candidates, {"orange_mask": orange_mask, "orange_border_mask": orange_border_mask}
 
-
-
-def _build_blue_candidates(
-    gray: np.ndarray,
-    image_bgr: np.ndarray,
-    border_px: int,
-    min_area_px: float,
-    outer_border_hex_candidates: list[str] | None,
-    blue_border_hex: str,
-) -> tuple[list[dict[str, Any]], dict[str, np.ndarray]]:
-    edges = _make_edge_mask(gray, border_px)
-    blue_mask = _make_blue_mask(image_bgr, outer_border_hex_candidates, blue_border_hex)
-    blue_mask = _clear_image_border(blue_mask, border_px)
-    blue_border_mask = _make_blue_border_mask(image_bgr, outer_border_hex_candidates, blue_border_hex)
-    blue_border_mask = _clear_image_border(blue_border_mask, border_px)
-
-    edge_support_region = cv2.dilate(blue_border_mask, np.ones((9, 9), np.uint8), iterations=1)
-    blue_supported_edges = cv2.bitwise_and(edges, edge_support_region)
-    blue_supported = _merge_masks(blue_border_mask, blue_supported_edges)
-    blue_supported = cv2.morphologyEx(blue_supported, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
-    blue_supported = _clear_image_border(blue_supported, border_px)
-
-    raw_candidates: list[dict[str, Any]] = []
-    raw_candidates.extend(
-        _collect_candidate_quads(
-            blue_border_mask,
-            min_area_px=min_area_px * 0.40,
-            source="blue_border",
-            retrieval_mode=cv2.RETR_EXTERNAL,
-        )
-    )
-    raw_candidates.extend(
-        _collect_candidate_quads(
-            blue_supported,
-            min_area_px=min_area_px * 0.50,
-            source="blue_supported",
-            retrieval_mode=cv2.RETR_EXTERNAL,
-        )
-    )
-    raw_candidates.extend(
-        _collect_candidate_quads(
-            blue_mask,
-            min_area_px=min_area_px * 0.70,
-            source="blue_broad",
-            retrieval_mode=cv2.RETR_EXTERNAL,
-        )
-    )
-    return raw_candidates, {"colour_mask": blue_mask, "colour_border_mask": blue_border_mask}
 
 def _dedupe_candidates(raw_candidates: list[dict[str, Any]], w: int, h: int) -> list[dict[str, Any]]:
     deduped: list[dict[str, Any]] = []
@@ -536,34 +434,34 @@ def _dedupe_candidates(raw_candidates: list[dict[str, Any]], w: int, h: int) -> 
 
 def _mode_specific_colour_score(
     gray: np.ndarray,
-    colour_mask: np.ndarray,
-    colour_border_mask: np.ndarray,
+    orange_mask: np.ndarray,
+    orange_border_mask: np.ndarray,
     quad: np.ndarray,
     requested_mode: str,
 ) -> tuple[str, float, dict[str, float]]:
     pts = [quad[0], quad[1], quad[2], quad[3]]
     black_side_scores = []
-    colour_side_scores = []
-    colour_band_width_scores = []
-    colour_parallel_penalties = []
+    orange_side_scores = []
+    orange_band_width_scores = []
+    orange_parallel_penalties = []
 
     for a, b in zip(pts, pts[1:] + pts[:1]):
         gray_strip = _sample_line_single(gray, a, b, half_width=2, samples=256)
         black_side_scores.append(float(np.mean(gray_strip[gray_strip.shape[0] // 2] < 175)))
 
-        if colour_mask.size > 0:
-            colour_strip = _sample_line_mask(colour_mask, a, b, half_width=2, samples=256)
-            colour_side_scores.append(float(np.mean(colour_strip > 0)))
-            colour_band_width_scores.append(_colour_band_width_score(colour_border_mask, a, b))
-            colour_parallel_penalties.append(_colour_parallel_penalty(colour_mask, a, b))
+        if orange_mask.size > 0:
+            orange_strip = _sample_line_mask(orange_mask, a, b, half_width=2, samples=256)
+            orange_side_scores.append(float(np.mean(orange_strip > 0)))
+            orange_band_width_scores.append(_orange_band_width_score(orange_border_mask, a, b))
+            orange_parallel_penalties.append(_orange_parallel_penalty(orange_mask, a, b))
 
     black_score = float(np.mean(black_side_scores)) if black_side_scores else 0.0
-    colour_side_score = float(np.mean(colour_side_scores)) if colour_side_scores else 0.0
-    colour_band_width_score = float(np.mean(colour_band_width_scores)) if colour_band_width_scores else 0.0
-    colour_parallel_penalty = float(np.mean(colour_parallel_penalties)) if colour_parallel_penalties else 0.0
-    colour_score = float(
+    orange_side_score = float(np.mean(orange_side_scores)) if orange_side_scores else 0.0
+    orange_band_width_score = float(np.mean(orange_band_width_scores)) if orange_band_width_scores else 0.0
+    orange_parallel_penalty = float(np.mean(orange_parallel_penalties)) if orange_parallel_penalties else 0.0
+    orange_score = float(
         np.clip(
-            0.60 * colour_side_score + 0.55 * colour_band_width_score - 0.35 * colour_parallel_penalty,
+            0.60 * orange_side_score + 0.55 * orange_band_width_score - 0.35 * orange_parallel_penalty,
             0.0,
             1.0,
         )
@@ -571,19 +469,13 @@ def _mode_specific_colour_score(
 
     details = {
         "black_side_score": black_score,
-        "colour_side_score": colour_side_score,
-        "colour_band_width_score": colour_band_width_score,
-        "colour_parallel_penalty": colour_parallel_penalty,
-        "orange_side_score": colour_side_score if requested_mode == "orange" else 0.0,
-        "orange_band_width_score": colour_band_width_score if requested_mode == "orange" else 0.0,
-        "orange_parallel_penalty": colour_parallel_penalty if requested_mode == "orange" else 0.0,
-        "blue_side_score": colour_side_score if requested_mode == "blue" else 0.0,
-        "blue_band_width_score": colour_band_width_score if requested_mode == "blue" else 0.0,
-        "blue_parallel_penalty": colour_parallel_penalty if requested_mode == "blue" else 0.0,
+        "orange_side_score": orange_side_score,
+        "orange_band_width_score": orange_band_width_score,
+        "orange_parallel_penalty": orange_parallel_penalty,
     }
 
-    if requested_mode in {"orange", "blue"}:
-        return requested_mode, colour_score, details
+    if requested_mode == "orange":
+        return "orange", orange_score, details
     return "black", black_score, details
 
 
@@ -598,7 +490,6 @@ def _detect_outer_border_in_mode(
     fiducial_hex_candidates: list[str] | None,
     border_colour_mode: str,
     orange_border_hex: str,
-    blue_border_hex: str,
 ) -> BorderDetectionResult:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
@@ -615,15 +506,6 @@ def _detect_outer_border_in_mode(
             outer_border_hex_candidates if use_colour_hint else None,
             orange_border_hex,
         )
-    elif border_colour_mode == "blue":
-        raw_candidates, masks = _build_blue_candidates(
-            gray,
-            image_bgr,
-            border_px,
-            min_area_px,
-            outer_border_hex_candidates if use_colour_hint else None,
-            blue_border_hex,
-        )
     else:
         raw_candidates, masks = _build_black_candidates(gray, border_px, min_area_px)
 
@@ -631,8 +513,8 @@ def _detect_outer_border_in_mode(
     if not candidates:
         raise RuntimeError(f"Could not detect CDS outer border candidate in {border_colour_mode!r} mode.")
 
-    colour_mask = masks["colour_mask"]
-    colour_border_mask = masks["colour_border_mask"]
+    orange_mask = masks["orange_mask"]
+    orange_border_mask = masks["orange_border_mask"]
 
     best: dict[str, Any] | None = None
     best_score = -1e9
@@ -665,8 +547,8 @@ def _detect_outer_border_in_mode(
 
         detected_border_mode, colour_score, colour_details = _mode_specific_colour_score(
             gray=gray,
-            colour_mask=colour_mask,
-            colour_border_mask=colour_border_mask,
+            orange_mask=orange_mask,
+            orange_border_mask=orange_border_mask,
             quad=quad,
             requested_mode=border_colour_mode,
         )
@@ -694,31 +576,23 @@ def _detect_outer_border_in_mode(
         extra_colour_weight = 0.0
         extra_colour_penalty = 0.0
         size_bonus = 0.0
-        colour_band_width_score = colour_details["colour_band_width_score"]
-        colour_parallel_penalty = colour_details["colour_parallel_penalty"]
 
-        if border_colour_mode in {"orange", "blue"}:
-            plausible = bool(plausible and colour_score >= 0.12 and colour_band_width_score >= 0.08)
-            source_bonus_lookup = {
-                "orange": {
-                    "orange_border": 0.45,
-                    "orange_supported": 0.25,
-                    "orange_broad": 0.10,
-                },
-                "blue": {
-                    "blue_border": 0.45,
-                    "blue_supported": 0.25,
-                    "blue_broad": 0.10,
-                },
-            }
-            source_bonus = source_bonus_lookup[border_colour_mode].get(cand.get("source", ""), 0.0)
+        if border_colour_mode == "orange":
+            orange_band_width_score = colour_details["orange_band_width_score"]
+            orange_parallel_penalty = colour_details["orange_parallel_penalty"]
+            plausible = bool(plausible and colour_score >= 0.12 and orange_band_width_score >= 0.08)
+            source_bonus = {
+                "orange_border": 0.45,
+                "orange_supported": 0.25,
+                "orange_broad": 0.10,
+            }.get(cand.get("source", ""), 0.0)
             size_bonus = 0.35 * float(np.clip((area_frac - 0.18) / 0.35, 0.0, 1.0))
             if area_frac > 0.78:
                 page_like_penalty += (area_frac - 0.78) * 3.5
             if bbox_frac > 0.87:
                 page_like_penalty += (bbox_frac - 0.87) * 3.2
-            extra_colour_weight = 1.25 * colour_band_width_score
-            extra_colour_penalty = 1.15 * colour_parallel_penalty
+            extra_colour_weight = 1.25 * orange_band_width_score
+            extra_colour_penalty = 1.15 * orange_parallel_penalty
         else:
             source_bonus = 0.15 if cand.get("source") == detected_border_mode else 0.0
 
@@ -751,8 +625,8 @@ def _detect_outer_border_in_mode(
             "side_score": float(side_score),
             "band_score": float(band_score),
             "colour_score": float(colour_score),
-            "colour_band_width_score": float(colour_band_width_score),
-            "colour_parallel_penalty": float(colour_parallel_penalty),
+            "orange_band_width_score": float(colour_details["orange_band_width_score"]),
+            "orange_parallel_penalty": float(colour_details["orange_parallel_penalty"]),
             "marker_support_score": float(marker_support_score),
             "page_like_penalty": float(page_like_penalty),
             "plausible": bool(plausible),
@@ -780,27 +654,21 @@ def _detect_outer_border_in_mode(
                 "bbox_frac": float(bbox_frac),
                 "detected_border_mode": detected_border_mode,
                 "source": cand.get("source", "unknown"),
-                "colour_side_score": float(colour_details["colour_side_score"]),
-                "black_side_score": float(colour_details["black_side_score"]),
-                "colour_band_width_score": float(colour_details["colour_band_width_score"]),
-                "colour_parallel_penalty": float(colour_details["colour_parallel_penalty"]),
                 "orange_side_score": float(colour_details["orange_side_score"]),
+                "black_side_score": float(colour_details["black_side_score"]),
                 "orange_band_width_score": float(colour_details["orange_band_width_score"]),
                 "orange_parallel_penalty": float(colour_details["orange_parallel_penalty"]),
-                "blue_side_score": float(colour_details["blue_side_score"]),
-                "blue_band_width_score": float(colour_details["blue_band_width_score"]),
-                "blue_parallel_penalty": float(colour_details["blue_parallel_penalty"]),
             }
 
     if best is None:
         raise RuntimeError(f"Could not detect CDS outer border candidate in {border_colour_mode!r} mode.")
 
     confidence = "high"
-    if border_colour_mode in {"orange", "blue"}:
+    if border_colour_mode == "orange":
         if (
             best["score"] < 3.3
             or best["colour_score"] < 0.18
-            or best["colour_band_width_score"] < 0.12
+            or best["orange_band_width_score"] < 0.12
             or best["ratio_score"] < 0.25
         ):
             confidence = "low"
@@ -815,50 +683,40 @@ def _detect_outer_border_in_mode(
         source = str(cand.get("source", "unknown"))
         source_counts[source] = source_counts.get(source, 0) + 1
 
-    diagnostics = {
-        "ratio_score": float(best["ratio_score"]),
-        "area_score": float(best["area_score"]),
-        "extent_score": float(best["extent_score"]),
-        "side_score": float(best["side_score"]),
-        "band_score": float(best["band_score"]),
-        "colour_score": float(best["colour_score"]),
-        "colour_side_score": float(best["colour_side_score"]),
-        "black_side_score": float(best["black_side_score"]),
-        "colour_band_width_score": float(best["colour_band_width_score"]),
-        "colour_parallel_penalty": float(best["colour_parallel_penalty"]),
-        "orange_side_score": float(best["orange_side_score"]),
-        "orange_band_width_score": float(best["orange_band_width_score"]),
-        "orange_parallel_penalty": float(best["orange_parallel_penalty"]),
-        "blue_side_score": float(best["blue_side_score"]),
-        "blue_band_width_score": float(best["blue_band_width_score"]),
-        "blue_parallel_penalty": float(best["blue_parallel_penalty"]),
-        "marker_support_score": float(best["marker_support_score"]),
-        "corner_score": float(best["corner_score"]),
-        "outside_penalty": float(best["outside_penalty"]),
-        "page_like_penalty": float(best["page_like_penalty"]),
-        "plausible": bool(best["plausible"]),
-        "area_frac": float(best["area_frac"]),
-        "bbox_frac": float(best["bbox_frac"]),
-        "requested_colour_mode": border_colour_mode,
-        "detected_border_mode": best["detected_border_mode"],
-        "candidate_source": best["source"],
-        "orange_border_hex": orange_border_hex,
-        "blue_border_hex": blue_border_hex,
-        "outer_border_hex_candidates": list(outer_border_hex_candidates or []),
-        "fiducial_hex_candidates": fiducial_hex_candidates or [],
-        "candidate_sources": source_counts,
-        "top_candidates": top_candidates,
-    }
-
     return BorderDetectionResult(
         ordered_corners_xy=[[float(x), float(y)] for x, y in ordered.tolist()],
         contour_area_px=float(best["contour_area_px"]),
         score=float(best["score"]),
         candidate_count=len(candidates),
         confidence=confidence,
-        diagnostics=diagnostics,
+        diagnostics={
+            "ratio_score": float(best["ratio_score"]),
+            "area_score": float(best["area_score"]),
+            "extent_score": float(best["extent_score"]),
+            "side_score": float(best["side_score"]),
+            "band_score": float(best["band_score"]),
+            "colour_score": float(best["colour_score"]),
+            "orange_side_score": float(best["orange_side_score"]),
+            "black_side_score": float(best["black_side_score"]),
+            "orange_band_width_score": float(best["orange_band_width_score"]),
+            "orange_parallel_penalty": float(best["orange_parallel_penalty"]),
+            "marker_support_score": float(best["marker_support_score"]),
+            "corner_score": float(best["corner_score"]),
+            "outside_penalty": float(best["outside_penalty"]),
+            "page_like_penalty": float(best["page_like_penalty"]),
+            "plausible": bool(best["plausible"]),
+            "area_frac": float(best["area_frac"]),
+            "bbox_frac": float(best["bbox_frac"]),
+            "requested_colour_mode": border_colour_mode,
+            "detected_border_mode": best["detected_border_mode"],
+            "candidate_source": best["source"],
+            "orange_border_hex": orange_border_hex,
+            "outer_border_hex_candidates": list(outer_border_hex_candidates or []),
+            "fiducial_hex_candidates": fiducial_hex_candidates or [],
+            "candidate_sources": source_counts,
+            "top_candidates": top_candidates,
+        },
     )
-
 
 
 def detect_outer_border(
@@ -872,16 +730,15 @@ def detect_outer_border(
     fiducial_hex_candidates: list[str] | None = None,
     border_colour_mode: str = "auto",
     orange_border_hex: str = "#D35400",
-    blue_border_hex: str = "#00CAEC",
 ) -> BorderDetectionResult:
     if image_bgr is None or image_bgr.size == 0:
         raise RuntimeError("Empty image passed to detect_outer_border().")
 
     requested_colour_mode = (border_colour_mode or "auto").strip().lower()
-    if requested_colour_mode not in {"auto", "black", "orange", "blue"}:
+    if requested_colour_mode not in {"auto", "black", "orange"}:
         requested_colour_mode = "auto"
 
-    if requested_colour_mode in {"black", "orange", "blue"}:
+    if requested_colour_mode in {"black", "orange"}:
         return _detect_outer_border_in_mode(
             image_bgr,
             expected_aspect_ratio,
@@ -892,12 +749,11 @@ def detect_outer_border(
             fiducial_hex_candidates=fiducial_hex_candidates,
             border_colour_mode=requested_colour_mode,
             orange_border_hex=orange_border_hex,
-            blue_border_hex=blue_border_hex,
         )
 
     attempts: list[tuple[str, BorderDetectionResult]] = []
     errors: dict[str, str] = {}
-    for mode in ("black", "orange", "blue"):
+    for mode in ("black", "orange"):
         try:
             attempts.append(
                 (
@@ -912,7 +768,6 @@ def detect_outer_border(
                         fiducial_hex_candidates=fiducial_hex_candidates,
                         border_colour_mode=mode,
                         orange_border_hex=orange_border_hex,
-                        blue_border_hex=blue_border_hex,
                     ),
                 )
             )

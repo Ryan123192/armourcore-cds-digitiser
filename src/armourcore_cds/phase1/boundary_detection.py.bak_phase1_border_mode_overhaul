@@ -1,0 +1,551 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import cv2
+import numpy as np
+
+
+@dataclass
+class BorderDetectionResult:
+    ordered_corners_xy: list[list[float]]
+    contour_area_px: float
+    score: float
+    candidate_count: int
+    confidence: str = "high"
+    diagnostics: dict[str, Any] | None = None
+
+
+def _hex_to_bgr(hex_colour: str) -> tuple[int, int, int]:
+    s = hex_colour.strip().lstrip("#")
+    if len(s) != 6:
+        raise ValueError(f"Expected 6-digit hex colour, got: {hex_colour!r}")
+    r = int(s[0:2], 16)
+    g = int(s[2:4], 16)
+    b = int(s[4:6], 16)
+    return (b, g, r)
+
+
+def _hex_to_hsv(hex_colour: str) -> tuple[int, int, int]:
+    bgr = np.uint8([[list(_hex_to_bgr(hex_colour))]])
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[0, 0]
+    return int(hsv[0]), int(hsv[1]), int(hsv[2])
+
+
+def _order_quad_points(pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).reshape(-1)
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    ordered[0] = pts[np.argmin(s)]  # top-left
+    ordered[1] = pts[np.argmin(d)]  # top-right
+    ordered[2] = pts[np.argmax(s)]  # bottom-right
+    ordered[3] = pts[np.argmax(d)]  # bottom-left
+    return ordered
+
+
+def _quad_side_lengths(quad: np.ndarray) -> tuple[float, float, float, float]:
+    tl, tr, br, bl = quad
+    top = float(np.linalg.norm(tr - tl))
+    right = float(np.linalg.norm(br - tr))
+    bottom = float(np.linalg.norm(br - bl))
+    left = float(np.linalg.norm(bl - tl))
+    return top, right, bottom, left
+
+
+def _quad_area(quad: np.ndarray) -> float:
+    return float(abs(cv2.contourArea(np.asarray(quad, dtype=np.float32))))
+
+
+def _sample_line_single(channel_2d: np.ndarray, p0: np.ndarray, p1: np.ndarray, half_width: int = 3, samples: int = 256) -> np.ndarray:
+    h, w = channel_2d.shape[:2]
+    xs = np.linspace(float(p0[0]), float(p1[0]), samples)
+    ys = np.linspace(float(p0[1]), float(p1[1]), samples)
+    dx = float(p1[0] - p0[0])
+    dy = float(p1[1] - p0[1])
+    length = max((dx * dx + dy * dy) ** 0.5, 1e-6)
+    nx = -dy / length
+    ny = dx / length
+    strips = []
+    for off in range(-half_width, half_width + 1):
+        xso = np.clip(np.round(xs + nx * off).astype(int), 0, w - 1)
+        yso = np.clip(np.round(ys + ny * off).astype(int), 0, h - 1)
+        strips.append(channel_2d[yso, xso].astype(np.float32))
+    return np.stack(strips, axis=0)
+
+
+def _sample_line_mask(mask: np.ndarray, p0: np.ndarray, p1: np.ndarray, half_width: int = 2, samples: int = 256) -> np.ndarray:
+    return _sample_line_single(mask, p0, p1, half_width=half_width, samples=samples)
+
+
+def _side_evidence(gray: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> tuple[float, float]:
+    strip = _sample_line_single(gray, p0, p1, half_width=4, samples=256)
+    centre = strip[strip.shape[0] // 2]
+    darkness = 1.0 - float(np.mean(centre) / 255.0)
+    support = float(np.mean(centre < 190))
+    band_support = float(np.mean(np.mean(strip < 200, axis=0) > 0.25))
+
+    # mild gap tolerance: reward having at least one decent continuous run but don't
+    # require perfection because creases/tape/glare can interrupt the border.
+    good = (np.mean(strip < 200, axis=0) > 0.25).astype(np.uint8)
+    longest = 0
+    current = 0
+    for v in good:
+        if v:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    longest_run = float(longest / max(len(good), 1))
+
+    score = 0.32 * darkness + 0.26 * support + 0.26 * band_support + 0.16 * longest_run
+    return score, band_support
+
+
+def _corner_support(gray: np.ndarray, corner: np.ndarray, radius: int = 36) -> float:
+    h, w = gray.shape[:2]
+    x = int(round(float(corner[0])))
+    y = int(round(float(corner[1])))
+    x0 = max(0, x - radius)
+    x1 = min(w, x + radius + 1)
+    y0 = max(0, y - radius)
+    y1 = min(h, y + radius + 1)
+    patch = gray[y0:y1, x0:x1]
+    if patch.size == 0:
+        return 0.0
+    dark = float(np.mean(patch < 195))
+    edge = cv2.Canny(patch, 60, 160)
+    edge_density = float(np.mean(edge > 0))
+    return 0.60 * dark + 0.40 * edge_density
+
+
+def _clear_image_border(mask: np.ndarray, border_px: int) -> np.ndarray:
+    out = mask.copy()
+    b = max(1, int(border_px))
+    out[:b, :] = 0
+    out[-b:, :] = 0
+    out[:, :b] = 0
+    out[:, -b:] = 0
+    return out
+
+
+def _occupancy_band_score(frac: float, lo: float, peak_lo: float, peak_hi: float, hi: float) -> float:
+    if frac <= lo or frac >= hi:
+        return 0.0
+    if peak_lo <= frac <= peak_hi:
+        return 1.0
+    if frac < peak_lo:
+        return float((frac - lo) / max(peak_lo - lo, 1e-6))
+    return float((hi - frac) / max(hi - peak_hi, 1e-6))
+
+
+def _is_frame_like_quad(quad: np.ndarray, w: int, h: int) -> bool:
+    q = np.asarray(quad, dtype=np.float32)
+    tol = max(8.0, 0.01 * min(w, h))
+    minx = float(np.min(q[:, 0]))
+    maxx = float(np.max(q[:, 0]))
+    miny = float(np.min(q[:, 1]))
+    maxy = float(np.max(q[:, 1]))
+    touches_all_edges = minx <= tol and miny <= tol and maxx >= (w - 1 - tol) and maxy >= (h - 1 - tol)
+    area_frac = _quad_area(q) / max(float(w * h), 1.0)
+    return bool(touches_all_edges or area_frac >= 0.975)
+
+
+def _collect_candidate_quads(mask: np.ndarray, min_area_px: float, source: str) -> list[dict[str, Any]]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: list[dict[str, Any]] = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area_px:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
+        quads: list[np.ndarray] = []
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            quads.append(approx.reshape(4, 2).astype(np.float32))
+
+        rect = cv2.minAreaRect(c)
+        quads.append(cv2.boxPoints(rect).astype(np.float32))
+
+        for q in quads:
+            ordered = _order_quad_points(q)
+            qa = _quad_area(ordered)
+            if qa < min_area_px:
+                continue
+            candidates.append(
+                {
+                    "quad": ordered,
+                    "contour_area_px": float(area),
+                    "source": source,
+                }
+            )
+    return candidates
+
+
+def _make_dark_mask(gray: np.ndarray, border_px: int) -> np.ndarray:
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(blur)
+    dark_mask = cv2.inRange(clahe, 0, 170)
+    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    dark_mask = _clear_image_border(dark_mask, border_px)
+    return dark_mask
+
+
+def _make_edge_mask(gray: np.ndarray, border_px: int) -> np.ndarray:
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(blur)
+    edges = cv2.Canny(clahe, 60, 180)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    edges = _clear_image_border(edges, border_px)
+    return edges
+
+
+def _broad_orange_mask(image_bgr: np.ndarray, orange_border_hex: str) -> np.ndarray:
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+
+    # Nominal digital orange window around the configured orange.
+    h0, s0, v0 = _hex_to_hsv(orange_border_hex)
+
+    # Printed/captured line is much duller and redder/browner than screen orange.
+    # Build a tolerant union:
+    masks = []
+
+    # Broad terracotta / red-orange / brown-orange window from real samples.
+    lower1 = np.array([4, 18, 70], dtype=np.uint8)
+    upper1 = np.array([24, 200, 230], dtype=np.uint8)
+    masks.append(cv2.inRange(hsv, lower1, upper1))
+
+    # Nominal configured orange, but with relaxed tolerance and low saturation floor.
+    lower2 = np.array([max(0, h0 - 18), max(10, s0 - 120), max(45, v0 - 120)], dtype=np.uint8)
+    upper2 = np.array([min(179, h0 + 18), 255, min(255, v0 + 120)], dtype=np.uint8)
+    masks.append(cv2.inRange(hsv, lower2, upper2))
+
+    # Muted warm ink fallback, useful when white balance pushes the line toward pinkish brown.
+    lower3 = np.array([0, 10, 80], dtype=np.uint8)
+    upper3 = np.array([18, 170, 235], dtype=np.uint8)
+    masks.append(cv2.inRange(hsv, lower3, upper3))
+
+    mask = masks[0]
+    for m in masks[1:]:
+        mask = cv2.bitwise_or(mask, m)
+
+    # Strengthen thin border lines while suppressing speckle.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    return mask
+
+
+def _marker_support_score(image_bgr: np.ndarray, quad: np.ndarray, fiducial_hex_candidates: list[str] | None) -> float:
+    if not fiducial_hex_candidates:
+        return 0.0
+    h, w = image_bgr.shape[:2]
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+
+    masks: list[np.ndarray] = []
+    for hex_colour in fiducial_hex_candidates:
+        try:
+            hh, ss, vv = _hex_to_hsv(hex_colour)
+        except Exception:
+            continue
+        lower = np.array([max(0, hh - 12), max(20, ss - 130), max(40, vv - 150)], dtype=np.uint8)
+        upper = np.array([min(179, hh + 12), 255, 255], dtype=np.uint8)
+        masks.append(cv2.inRange(hsv, lower, upper))
+    if not masks:
+        return 0.0
+    mask = masks[0]
+    for m in masks[1:]:
+        mask = cv2.bitwise_or(mask, m)
+
+    scores = []
+    radius = max(16, int(round(0.025 * min(h, w))))
+    for corner in quad:
+        x = int(round(float(corner[0])))
+        y = int(round(float(corner[1])))
+        x0 = max(0, x - radius)
+        x1 = min(w, x + radius + 1)
+        y0 = max(0, y - radius)
+        y1 = min(h, y + radius + 1)
+        patch = mask[y0:y1, x0:x1]
+        if patch.size == 0:
+            scores.append(0.0)
+            continue
+        scores.append(float(np.mean(patch > 0)))
+    scores = sorted(scores, reverse=True)
+    if not scores:
+        return 0.0
+    return float(np.mean(scores[:3]))
+
+
+def _outside_envelope_penalty(gray: np.ndarray, quad: np.ndarray) -> float:
+    penalties = []
+    pts = [quad[0], quad[1], quad[2], quad[3]]
+    for a, b in zip(pts, pts[1:] + pts[:1]):
+        inner = _sample_line_single(gray, a, b, half_width=2, samples=192)
+        outer = _sample_line_single(gray, a, b, half_width=10, samples=192)
+        inner_dark = 1.0 - float(np.mean(inner[inner.shape[0] // 2]) / 255.0)
+        outer_dark = 1.0 - float(np.mean(outer[0]) / 255.0)
+        penalties.append(max(0.0, outer_dark - inner_dark))
+    return float(np.mean(penalties))
+
+
+def _build_candidates_from_masks(gray: np.ndarray, image_bgr: np.ndarray, border_px: int, min_area_px: float, border_colour_mode: str, orange_border_hex: str) -> tuple[list[dict[str, Any]], np.ndarray]:
+    edges = _make_edge_mask(gray, border_px)
+    dark_mask = _make_dark_mask(gray, border_px)
+
+    orange_mask = _broad_orange_mask(image_bgr, orange_border_hex)
+    orange_mask = _clear_image_border(orange_mask, border_px)
+
+    combined = cv2.bitwise_or(edges, dark_mask)
+    if border_colour_mode in {"orange", "auto"}:
+        combined = cv2.bitwise_or(combined, orange_mask)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    combined = _clear_image_border(combined, border_px)
+
+    raw_candidates: list[dict[str, Any]] = []
+    raw_candidates.extend(_collect_candidate_quads(edges, min_area_px=min_area_px, source="edges"))
+    raw_candidates.extend(_collect_candidate_quads(dark_mask, min_area_px=min_area_px, source="dark"))
+    if border_colour_mode in {"orange", "auto"}:
+        raw_candidates.extend(_collect_candidate_quads(orange_mask, min_area_px=min_area_px * 0.35, source="orange"))
+    raw_candidates.extend(_collect_candidate_quads(combined, min_area_px=min_area_px, source="combined"))
+
+    h, w = gray.shape[:2]
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for cand in raw_candidates:
+        q = cand["quad"]
+        if _is_frame_like_quad(q, w, h):
+            continue
+        top, right, bottom, left = _quad_side_lengths(q)
+        cx = int(round(float(np.mean(q[:, 0])) / 24.0))
+        cy = int(round(float(np.mean(q[:, 1])) / 24.0))
+        ww = int(round(((top + bottom) / 2.0) / 24.0))
+        hh = int(round(((left + right) / 2.0) / 24.0))
+        key = (cx, cy, ww, hh)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cand)
+    return deduped, orange_mask
+
+
+def _mode_specific_colour_score(
+    gray: np.ndarray,
+    orange_mask: np.ndarray,
+    quad: np.ndarray,
+    requested_mode: str,
+) -> tuple[str, float]:
+    pts = [quad[0], quad[1], quad[2], quad[3]]
+    orange_side_scores = []
+    black_side_scores = []
+
+    for a, b in zip(pts, pts[1:] + pts[:1]):
+        orange_strip = _sample_line_mask(orange_mask, a, b, half_width=2, samples=256)
+        orange_side_scores.append(float(np.mean(orange_strip > 0)))
+
+        gray_strip = _sample_line_single(gray, a, b, half_width=2, samples=256)
+        black_side_scores.append(float(np.mean(gray_strip[gray_strip.shape[0] // 2] < 175)))
+
+    orange_score = float(np.mean(orange_side_scores))
+    black_score = float(np.mean(black_side_scores))
+
+    if requested_mode == "orange":
+        return "orange", orange_score
+    if requested_mode == "black":
+        return "black", black_score
+
+    # auto: whichever actually has stronger side evidence wins.
+    if orange_score >= black_score:
+        return "orange", orange_score
+    return "black", black_score
+
+
+def detect_outer_border(
+    image_bgr: np.ndarray,
+    expected_aspect_ratio: float,
+    *,
+    use_colour_hint: bool = True,
+    use_shape_constraints: bool = True,
+    fallback_to_fiducials: bool = True,
+    outer_border_hex_candidates: list[str] | None = None,
+    fiducial_hex_candidates: list[str] | None = None,
+    border_colour_mode: str = "auto",
+    orange_border_hex: str = "#D35400",
+) -> BorderDetectionResult:
+    if image_bgr is None or image_bgr.size == 0:
+        raise RuntimeError("Empty image passed to detect_outer_border().")
+
+    requested_colour_mode = (border_colour_mode or "auto").strip().lower()
+    if requested_colour_mode not in {"auto", "black", "orange"}:
+        requested_colour_mode = "auto"
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    image_area = float(h * w)
+    min_area_px = 0.02 * image_area
+    border_px = max(4, int(round(min(h, w) * 0.008)))
+
+    candidates, orange_mask = _build_candidates_from_masks(
+        gray=gray,
+        image_bgr=image_bgr,
+        border_px=border_px,
+        min_area_px=min_area_px,
+        border_colour_mode=requested_colour_mode,
+        orange_border_hex=orange_border_hex,
+    )
+    if not candidates:
+        raise RuntimeError("Could not detect CDS outer border candidate.")
+
+    best: dict[str, Any] | None = None
+    best_score = -1e9
+
+    for cand in candidates:
+        quad = cand["quad"]
+        top, right, bottom, left = _quad_side_lengths(quad)
+        width = max((top + bottom) / 2.0, 1e-6)
+        height = max((left + right) / 2.0, 1e-6)
+
+        ratio = width / height
+        ratio_err = abs(np.log(max(ratio, 1e-6) / max(expected_aspect_ratio, 1e-6)))
+        ratio_score = max(0.0, 1.0 - ratio_err / 0.40)
+
+        area = _quad_area(quad)
+        area_frac = area / image_area
+        bbox_frac = (float(np.ptp(quad[:, 0])) * float(np.ptp(quad[:, 1]))) / image_area
+
+        area_score = _occupancy_band_score(area_frac, lo=0.08, peak_lo=0.22, peak_hi=0.78, hi=0.93)
+        extent_score = _occupancy_band_score(bbox_frac, lo=0.10, peak_lo=0.25, peak_hi=0.82, hi=0.95)
+
+        side_scores = []
+        band_scores = []
+        pts = list(quad)
+        for p0, p1 in zip(pts, pts[1:] + pts[:1]):
+            s, b = _side_evidence(gray, p0, p1)
+            side_scores.append(s)
+            band_scores.append(b)
+        side_score = float(np.mean(side_scores))
+        band_score = float(np.mean(band_scores))
+
+        detected_border_mode, colour_score = _mode_specific_colour_score(
+            gray=gray,
+            orange_mask=orange_mask,
+            quad=quad,
+            requested_mode=requested_colour_mode,
+        )
+
+        marker_support_score = _marker_support_score(
+            image_bgr=image_bgr,
+            quad=quad,
+            fiducial_hex_candidates=fiducial_hex_candidates,
+        )
+
+        corner_scores = [_corner_support(gray, p) for p in quad]
+        corner_score = float(np.mean(sorted(corner_scores, reverse=True)[:3]))
+        outside_penalty = _outside_envelope_penalty(gray, quad)
+
+        plausible = bool(
+            area_frac >= 0.10
+            and area_frac <= 0.94
+            and bbox_frac >= 0.16
+            and bbox_frac <= 0.95
+            and ratio_score >= 0.18
+            and (side_score >= 0.16 or band_score >= 0.18)
+        )
+        if requested_colour_mode == "orange":
+            plausible = bool(plausible and colour_score >= 0.10)
+
+        if not plausible:
+            continue
+
+        source_bonus = 0.15 if cand.get("source") == detected_border_mode else 0.0
+
+        # If orange is requested, punish oversized page-like candidates much harder.
+        page_like_penalty = 0.0
+        if requested_colour_mode == "orange":
+            if area_frac > 0.66:
+                page_like_penalty += (area_frac - 0.66) * 4.0
+            if bbox_frac > 0.80:
+                page_like_penalty += (bbox_frac - 0.80) * 3.5
+            if colour_score < 0.18:
+                page_like_penalty += (0.18 - colour_score) * 3.0
+
+        total = (
+            2.35 * ratio_score
+            + 1.10 * area_score
+            + 0.95 * extent_score
+            + 2.00 * side_score
+            + 1.00 * band_score
+            + 1.70 * colour_score
+            + 0.90 * marker_support_score
+            + 0.70 * corner_score
+            + source_bonus
+            - 1.20 * outside_penalty
+            - page_like_penalty
+        )
+
+        if total > best_score:
+            best_score = total
+            best = {
+                "quad": quad,
+                "contour_area_px": cand["contour_area_px"],
+                "score": float(total),
+                "ratio_score": float(ratio_score),
+                "area_score": float(area_score),
+                "extent_score": float(extent_score),
+                "side_score": float(side_score),
+                "band_score": float(band_score),
+                "colour_score": float(colour_score),
+                "marker_support_score": float(marker_support_score),
+                "corner_score": float(corner_score),
+                "outside_penalty": float(outside_penalty),
+                "page_like_penalty": float(page_like_penalty),
+                "plausible": bool(plausible),
+                "area_frac": float(area_frac),
+                "bbox_frac": float(bbox_frac),
+                "detected_border_mode": detected_border_mode,
+                "source": cand.get("source", "unknown"),
+            }
+
+    if best is None:
+        raise RuntimeError("Could not detect CDS outer border candidate.")
+
+    confidence = "high"
+    if (
+        best["score"] < 3.2
+        or best["side_score"] < 0.22
+        or best["ratio_score"] < 0.25
+        or (requested_colour_mode == "orange" and best["colour_score"] < 0.18)
+    ):
+        confidence = "low"
+
+    ordered = best["quad"]
+    return BorderDetectionResult(
+        ordered_corners_xy=[[float(x), float(y)] for x, y in ordered.tolist()],
+        contour_area_px=float(best["contour_area_px"]),
+        score=float(best["score"]),
+        candidate_count=len(candidates),
+        confidence=confidence,
+        diagnostics={
+            "ratio_score": float(best["ratio_score"]),
+            "area_score": float(best["area_score"]),
+            "extent_score": float(best["extent_score"]),
+            "side_score": float(best["side_score"]),
+            "band_score": float(best["band_score"]),
+            "colour_score": float(best["colour_score"]),
+            "marker_support_score": float(best["marker_support_score"]),
+            "corner_score": float(best["corner_score"]),
+            "outside_penalty": float(best["outside_penalty"]),
+            "page_like_penalty": float(best["page_like_penalty"]),
+            "plausible": bool(best["plausible"]),
+            "area_frac": float(best["area_frac"]),
+            "bbox_frac": float(best["bbox_frac"]),
+            "requested_colour_mode": requested_colour_mode,
+            "detected_border_mode": best["detected_border_mode"],
+            "candidate_source": best["source"],
+            "orange_border_hex": orange_border_hex,
+            "fiducial_hex_candidates": fiducial_hex_candidates or [],
+        },
+    )
