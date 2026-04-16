@@ -39,7 +39,18 @@ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -
     debug.image('01_input_original', input_image)
 
     expected_aspect_ratio = float(template.design_area_mm.width) / float(template.design_area_mm.height)
-    border = detect_outer_border(input_image, expected_aspect_ratio=expected_aspect_ratio)
+    template_border_cfg = template.border_detection or {}
+    template_colour_hints = template_border_cfg.get('colour_hints', {}) if isinstance(template_border_cfg, dict) else {}
+    border_colour_mode = str(app_config.get('processing', {}).get('border_colour_mode', 'auto')).strip().lower()
+    orange_border_hex = str(app_config.get('processing', {}).get('orange_border_hex', '#D35400')).strip()
+    fiducial_hex_candidates = template_colour_hints.get('fiducial_hex_candidates', ['#FF0000'])
+    border = detect_outer_border(
+        input_image,
+        expected_aspect_ratio=expected_aspect_ratio,
+        border_colour_mode=border_colour_mode,
+        orange_border_hex=orange_border_hex,
+        fiducial_hex_candidates=fiducial_hex_candidates,
+    )
 
     contour_overlay = draw_polygon(input_image, border.ordered_corners_xy, (0, 255, 0), thickness=6)
     debug.image('04_border_detected', contour_overlay)
@@ -101,6 +112,8 @@ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -
             'score': float(border.score),
             'candidate_count': int(border.candidate_count),
             'confidence': border.confidence,
+            'requested_colour_mode': (border.diagnostics or {}).get('requested_colour_mode', border_colour_mode),
+            'detected_border_mode': (border.diagnostics or {}).get('detected_border_mode', 'unknown'),
             'diagnostics': border.diagnostics or {},
         },
         'rectification': {

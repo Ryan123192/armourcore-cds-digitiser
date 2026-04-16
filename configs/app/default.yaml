@@ -12,6 +12,8 @@ output:
 processing:
   default_template: cds_regular_500x600
   preferred_output_dpi: 400
+  border_colour_mode: Orange
+  orange_border_hex: "#D35400"
   preserve_customer_dark_marks: true
   single_file_mode: true
 

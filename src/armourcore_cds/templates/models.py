@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DesignArea(BaseModel):
@@ -8,8 +8,32 @@ class DesignArea(BaseModel):
     height: float
 
 
+class GridModel(BaseModel):
+    minor_spacing_mm: float = 10.0
+    major_spacing_mm: float = 50.0
+
+
+class ColourHintsModel(BaseModel):
+    outer_border_hex_candidates: list[str] = Field(default_factory=list)
+    fiducial_hex_candidates: list[str] = Field(default_factory=list)
+
+
+class BorderDetectionModel(BaseModel):
+    use_colour_hint: bool | None = None
+    use_shape_constraints: bool | None = None
+    fallback_to_fiducials: bool | None = None
+    colour_hints: ColourHintsModel | None = None
+
+
+class TemplateOutputsModel(BaseModel):
+    write_rectified: bool | None = None
+    write_scaled: bool | None = None
+    write_cropped: bool | None = None
+    write_debug: bool | None = None
+
+
 class TemplateModel(BaseModel):
-    model_config = ConfigDict(extra='ignore')
+    model_config = ConfigDict(extra="ignore")
 
     template_id: str
     display_name: str
@@ -18,3 +42,7 @@ class TemplateModel(BaseModel):
     preferred_output_dpi: int
     primary_geometry_truth: str
     fiducials_enabled: bool
+
+    grid: GridModel | None = None
+    border_detection: BorderDetectionModel | None = None
+    outputs: TemplateOutputsModel | None = None

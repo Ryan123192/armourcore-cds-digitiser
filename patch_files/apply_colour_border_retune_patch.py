@@ -1,3 +1,11 @@
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+BOUNDARY_DETECTION = r"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -549,3 +557,37 @@ def detect_outer_border(
             "fiducial_hex_candidates": fiducial_hex_candidates or [],
         },
     )
+"""
+
+def patch_default_yaml(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if "border_colour_mode:" not in text:
+        text = text.rstrip() + '\nprocessing:\n  border_colour_mode: auto\n  orange_border_hex: "#D35400"\n'
+    else:
+        if "orange_border_hex:" not in text:
+            text = re.sub(r"(border_colour_mode:\s*[A-Za-z_]+)", r'\1\n  orange_border_hex: "#D35400"', text)
+    path.write_text(text, encoding="utf-8")
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Usage: python apply_colour_border_retune_patch.py <repo_root>")
+        return 2
+
+    root = Path(sys.argv[1]).resolve()
+    bd = root / "src" / "armourcore_cds" / "phase1" / "boundary_detection.py"
+    default_yaml = root / "configs" / "app" / "default.yaml"
+
+    if not bd.exists():
+        raise SystemExit(f"Could not find {bd}")
+    bd.write_text(BOUNDARY_DETECTION.lstrip(), encoding="utf-8")
+    if default_yaml.exists():
+        patch_default_yaml(default_yaml)
+
+    print("Patched:")
+    print(f" - {bd}")
+    if default_yaml.exists():
+        print(f" - {default_yaml}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
