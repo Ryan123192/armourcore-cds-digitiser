@@ -46,7 +46,7 @@ def test_detect_outer_border_on_synthetic_orange_sheet():
     assert result.score > 0
     assert result.diagnostics["detected_border_mode"] == "orange"
     assert result.diagnostics["colour_score"] >= 0.12
-    assert result.diagnostics["orange_band_width_score"] >= 0.08
+    assert result.diagnostics["colour_band_width_score"] >= 0.08
 
 
 def test_detect_outer_border_on_synthetic_blue_sheet():
@@ -71,4 +71,4 @@ def test_detect_outer_border_on_synthetic_blue_sheet():
     assert result.score > 0
     assert result.diagnostics["detected_border_mode"] == "blue"
     assert result.diagnostics["colour_score"] >= 0.12
-    assert result.diagnostics["blue_band_width_score"] >= 0.08
+    assert result.diagnostics["colour_band_width_score"] >= 0.08

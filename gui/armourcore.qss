@@ -1,0 +1,249 @@
+/* =====================================================================
+   ArmourCore CDS Vectoriser — Qt Style Sheet
+   =====================================================================
+   Dark industrial theme matching ArmourCore's visual identity:
+   * Charcoal background (#0E1116)
+   * Card / panel surfaces in slightly lighter charcoal (#1B1F24)
+   * Cyan accent (#00B5C8) for primary CTA, hover, focus
+   * Light grey body text (#E6E8EB), muted greys for hints (#9AA3AD)
+   * Sharp 3 px corner radius, no gradients, no drop shadows.
+
+   To re-skin, just edit the colour hex codes below and relaunch.
+   ===================================================================== */
+
+* {
+    font-family: "Segoe UI", "Inter", "Montserrat", sans-serif;
+    color: #E6E8EB;
+}
+
+QMainWindow, QDialog {
+    background-color: #0E1116;
+}
+
+QWidget#CentralWidget {
+    background-color: #0E1116;
+}
+
+/* Section labels (use this objectName for emphasised "heading" labels) */
+QLabel {
+    color: #E6E8EB;
+    font-size: 10pt;
+    background-color: transparent;
+}
+QLabel[heading="true"] {
+    color: #FFFFFF;
+    font-weight: 700;
+    font-size: 10pt;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    padding-top: 4px;
+}
+QLabel[muted="true"] {
+    color: #9AA3AD;
+    font-size: 9pt;
+}
+
+/* Frames / cards */
+QFrame {
+    background-color: #1B1F24;
+    border: 1px solid #262B31;
+    border-radius: 4px;
+}
+
+/* Splitter handle */
+QSplitter::handle {
+    background-color: #0E1116;
+}
+QSplitter::handle:horizontal { width: 3px; }
+QSplitter::handle:vertical   { height: 3px; }
+
+/* Buttons */
+QPushButton {
+    background-color: #1B1F24;
+    color: #E6E8EB;
+    border: 1px solid #2E343B;
+    border-radius: 3px;
+    padding: 8px 16px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    min-height: 14px;
+}
+QPushButton:hover {
+    border-color: #00B5C8;
+    color: #FFFFFF;
+}
+QPushButton:pressed {
+    background-color: #0E1116;
+}
+QPushButton:disabled {
+    background-color: #15191E;
+    color: #4A5159;
+    border-color: #20262C;
+}
+
+/* Primary CTA — set objectName="StartButton" */
+QPushButton#StartButton {
+    background-color: #00B5C8;
+    color: #0E1116;
+    border: none;
+}
+QPushButton#StartButton:hover {
+    background-color: #1FC8DB;
+}
+QPushButton#StartButton:pressed {
+    background-color: #008FA0;
+}
+QPushButton#StartButton:disabled {
+    background-color: #2A3438;
+    color: #4A5159;
+}
+
+/* Destructive CTA — set objectName="StopButton" */
+QPushButton#StopButton {
+    background-color: #A3413F;
+    color: #FFFFFF;
+    border: none;
+}
+QPushButton#StopButton:hover   { background-color: #BC4E4C; }
+QPushButton#StopButton:pressed { background-color: #823230; }
+
+/* Text inputs */
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+    background-color: #15191E;
+    color: #E6E8EB;
+    border: 1px solid #2E343B;
+    border-radius: 3px;
+    padding: 6px 8px;
+    selection-background-color: #00B5C8;
+    selection-color: #0E1116;
+}
+QLineEdit:focus, QTextEdit:focus, QComboBox:focus,
+QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color: #00B5C8;
+}
+
+/* Combo box dropdown look */
+QComboBox::drop-down {
+    border: 0;
+    width: 22px;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #9AA3AD;
+    margin-right: 6px;
+}
+QComboBox QAbstractItemView {
+    background-color: #15191E;
+    color: #E6E8EB;
+    selection-background-color: #00B5C8;
+    selection-color: #0E1116;
+    border: 1px solid #2E343B;
+}
+
+/* Progress bar */
+QProgressBar {
+    background: #15191E;
+    border: 1px solid #2E343B;
+    border-radius: 3px;
+    text-align: center;
+    color: #E6E8EB;
+    height: 18px;
+}
+QProgressBar::chunk {
+    background-color: #00B5C8;
+}
+
+/* Tables */
+QTableWidget, QTreeView, QListView {
+    background-color: #15191E;
+    alternate-background-color: #181D22;
+    gridline-color: #262B31;
+    border: 1px solid #2E343B;
+    selection-background-color: #00B5C8;
+    selection-color: #0E1116;
+}
+QHeaderView::section {
+    background-color: #1B1F24;
+    color: #9AA3AD;
+    padding: 6px 8px;
+    border: 0;
+    border-right: 1px solid #262B31;
+    border-bottom: 1px solid #262B31;
+    text-transform: uppercase;
+    font-size: 9pt;
+    letter-spacing: 0.5px;
+}
+QTableCornerButton::section {
+    background-color: #1B1F24;
+    border: 0;
+}
+
+/* Log panel — set objectName="LogView" */
+QTextEdit#LogView {
+    background-color: #0B0E11;
+    color: #B8C0CC;
+    font-family: "Consolas", "JetBrains Mono", "Courier New", monospace;
+    font-size: 10pt;
+    border: 1px solid #262B31;
+}
+
+/* Preview image holder — set objectName="PreviewArea" */
+QLabel#PreviewArea {
+    background-color: #0B0E11;
+    color: #6A7280;
+    border: 1px solid #262B31;
+    border-radius: 4px;
+    padding: 0;
+}
+
+/* Footer status bar */
+QStatusBar {
+    background: #0B0E11;
+    color: #9AA3AD;
+}
+
+/* Tooltips */
+QToolTip {
+    background-color: #15191E;
+    color: #E6E8EB;
+    border: 1px solid #00B5C8;
+    padding: 4px 8px;
+}
+
+/* Scrollbars (subtle) */
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: #0E1116;
+    border: 0;
+}
+QScrollBar:vertical   { width: 10px; }
+QScrollBar:horizontal { height: 10px; }
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: #2E343B;
+    border-radius: 4px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+    background: #00B5C8;
+}
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+
+/* Checkboxes */
+QCheckBox {
+    spacing: 6px;
+    color: #E6E8EB;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    background-color: #15191E;
+    border: 1px solid #2E343B;
+    border-radius: 2px;
+}
+QCheckBox::indicator:hover { border-color: #00B5C8; }
+QCheckBox::indicator:checked {
+    background-color: #00B5C8;
+    border-color: #00B5C8;
+}

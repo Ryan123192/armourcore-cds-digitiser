@@ -80,6 +80,11 @@ def run_phase1_pipeline(input_path: Path, template_id: str, config_path: Path) -
         blue_border_hex=blue_border_hex,
     )
 
+    # Save mask debug images returned by the detector
+    for mask_name, mask_img in (border.debug_images or {}).items():
+        if mask_img is not None and mask_img.size > 0 and mask_img.any():
+            debug.image(f"02_{mask_name}", mask_img)
+
     contour_overlay = draw_polygon(input_image, border.ordered_corners_xy, (0, 255, 0), thickness=6)
     debug.image("04_border_detected", contour_overlay)
 
