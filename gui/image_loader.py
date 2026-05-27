@@ -1,17 +1,21 @@
-"""Input-image format normalisation.
+"""Input-image format / orientation normalisation.
 
-The downstream Phase 1 pipeline calls ``cv2.imread`` which doesn't
-understand HEIC / HEIF (Apple's iOS-default photo format).  This
-module detects HEIC inputs and pre-converts them to PNG in a
-temporary folder so Phase 1 sees an image it can load.
+Two pre-processing helpers, both designed to run BEFORE Phase 1 so
+that downstream code never has to think about input quirks.
 
-For all other formats it returns the original path unchanged, so
-the conversion has zero overhead on the common case.
+* ``ensure_loadable_image(path)``  — HEIC/HEIF -> PNG via pillow-heif.
+* ``ensure_landscape(path)``       — portrait -> 90-deg rotated PNG.
+
+Both write to a process-shared temp folder so repeated runs on the
+same file reuse the cached copy.  Both return the original path
+unchanged when no conversion is needed (zero overhead common case).
 
 Usage::
 
-    from gui.image_loader import ensure_loadable_image
-    path_for_phase1 = ensure_loadable_image(user_input_path)
+    from gui.image_loader import ensure_loadable_image, ensure_landscape
+    loadable = ensure_loadable_image(user_input_path)
+    oriented = ensure_landscape(loadable)
+    # pass `oriented` to Phase 1
 """
 from __future__ import annotations
 
@@ -53,6 +57,47 @@ def ensure_loadable_image(input_path: Path) -> Path:
     # Unknown suffix — let Phase 1 fail with its own clearer error
     # rather than silently mangling something we don't understand.
     return input_path
+
+
+def ensure_landscape(input_path: Path) -> tuple[Path, bool]:
+    """Rotate a portrait input to landscape if needed (ISSUE-001 / H).
+
+    Phase 1's rectifier was tuned for landscape-oriented inputs and
+    fails or mis-classifies portrait shots.  Simple rule: if the
+    image is taller than it is wide, rotate 90 deg clockwise and
+    hand the rotated PNG to Phase 1.  PDFs and HEICs are expected
+    to have already been converted to PNG by ``ensure_loadable_image``
+    before this is called.
+
+    Returns
+    -------
+    (path_to_use, was_rotated)
+        path_to_use : either the original path or a temp PNG copy
+        was_rotated : True if a rotation happened, False otherwise
+    """
+    import cv2
+
+    input_path = Path(input_path)
+    suffix = input_path.suffix.lower()
+    if suffix == ".pdf":
+        # PDF rasterisation happens inside Phase 1; orientation is
+        # decided there.  Skip.
+        return input_path, False
+
+    img = cv2.imread(str(input_path))
+    if img is None:
+        # Let the downstream loader raise its own clear error
+        return input_path, False
+    h, w = img.shape[:2]
+    if h <= w:
+        return input_path, False     # already landscape
+
+    rotated = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    tmp_root = Path(tempfile.gettempdir()) / "armourcore_oriented"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    out_path = tmp_root / f"{input_path.stem}_landscape.png"
+    cv2.imwrite(str(out_path), rotated)
+    return out_path, True
 
 
 def _convert_heic_to_png(heic_path: Path) -> Path:

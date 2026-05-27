@@ -22,8 +22,12 @@ import platform
 import subprocess
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread
-from PyQt6.QtGui import QPixmap, QFont, QIcon
+import cv2
+import numpy as np
+from PyQt6.QtCore import Qt, QThread, QSettings, QSize, QUrl
+from PyQt6.QtGui import (
+    QPixmap, QFont, QIcon, QImage, QDragEnterEvent, QDropEvent,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
@@ -53,6 +57,42 @@ COL_FILENAME = 1
 COL_TEMPLATE = 2
 COL_STATUS = 3
 
+# Preview thumbnail size cap.  Prevents Qt from rejecting huge production
+# rasters (QImageIOHandler default is a 256 MB allocation limit and our
+# rectified PNGs comfortably blow past that).  See ISSUE-010.
+PREVIEW_MAX_DIM = 1400
+
+# Default output root if the user hasn't picked one yet.
+DEFAULT_OUTPUT_ROOT = REPO / "data" / "outputs" / "end_to_end"
+
+
+def _load_thumbnail_pixmap(path: Path, max_dim: int = PREVIEW_MAX_DIM) -> QPixmap | None:
+    """Load an image as a downscaled QPixmap safe for GUI display.
+
+    Bypasses ``QPixmap(path)`` because PyQt enforces a 256 MB image-byte
+    allocation limit by default and our production rectified PNGs can
+    exceed it (4094 x 5512 x 3 = ~64 MB raw, ~110 MB decoded with
+    alpha).  Loading via cv2 and downscaling to a sensible thumbnail
+    keeps memory bounded and never hits the Qt limit.
+    """
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / float(max(h, w))
+        img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                         interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    rgb = np.ascontiguousarray(rgb)
+    qimg = QImage(
+        rgb.data, rgb.shape[1], rgb.shape[0],
+        rgb.strides[0],
+        QImage.Format.Format_RGB888,
+    )
+    # Copy because the underlying numpy buffer can be reclaimed.
+    return QPixmap.fromImage(qimg.copy())
+
 
 def _open_in_explorer(path: Path) -> None:
     path = Path(path)
@@ -77,10 +117,18 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1400, 880)
 
+        # Persistent user settings (last folders, preview prefs, etc.)
+        # Stored per-user via QSettings; nothing leaks into the project.
+        self._settings = QSettings("ArmourCore", "CDS Vectoriser")
+
+        # Drag-and-drop input support (ISSUE-007).
+        self.setAcceptDrops(True)
+
         # Runtime state
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
         self._last_result: RunResult | None = None
+        self._last_rectified_path: Path | None = None
 
         # Batch queue
         self._batch_queue: list[dict] = []      # list of row-info dicts
@@ -90,6 +138,51 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._set_processing(False)
+
+    # ------------------------------------------------------------------
+    # Drag-and-drop (ISSUE-007) — accept image / PDF / HEIC files
+    # dropped onto the window from File Explorer.
+    # ------------------------------------------------------------------
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        added = 0
+        skipped = 0
+        for url in event.mimeData().urls():
+            p = Path(url.toLocalFile())
+            if not p.exists():
+                continue
+            if p.is_dir():
+                # Treat folder-drop the same as Browse Folder...
+                for c in sorted(p.iterdir()):
+                    if (c.is_file()
+                            and c.suffix.lower() in SUPPORTED_INPUT_SUFFIXES
+                            and self._add_input_row(c)):
+                        added += 1
+                continue
+            if p.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+                skipped += 1
+                continue
+            if self._add_input_row(p):
+                added += 1
+            else:
+                skipped += 1
+        if added:
+            self.footer.setText(
+                f"Drag-and-drop: added {added} file(s)"
+                + (f", skipped {skipped}" if skipped else "")
+                + "."
+            )
+        elif skipped:
+            self.footer.setText(
+                f"Drag-and-drop: skipped {skipped} unsupported file(s)."
+            )
+        event.acceptProposedAction()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -187,15 +280,52 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._on_stop)
         left.addWidget(self.stop_btn)
 
-        # Output helper buttons
-        out_row = QHBoxLayout()
+        # Debug-output toggle (D) — choose between lean production output
+        # (Off: 3 files + run_report.json) and Full (adds per-phase
+        # debug copies, per-tool crops, and a complete log.txt).
+        left.addSpacing(6)
+        left.addWidget(self._heading("Debug output"))
+        self.debug_combo = QComboBox()
+        self.debug_combo.addItem(
+            "Off  —  rectified + vectors + summary + run_report.json",
+            userData="off",
+        )
+        self.debug_combo.addItem(
+            "Full  —  + phase 1/2 intermediates, per-tool crops, log.txt",
+            userData="full",
+        )
+        last_debug = self._settings.value("last_debug_mode", "off", type=str)
+        for i in range(self.debug_combo.count()):
+            if self.debug_combo.itemData(i) == last_debug:
+                self.debug_combo.setCurrentIndex(i)
+                break
+        self.debug_combo.currentIndexChanged.connect(self._on_debug_mode_changed)
+        left.addWidget(self.debug_combo)
+
+        # Output-folder selector (ISSUE-008) — user picks where outputs go.
+        # Defaults to the last-used folder (ISSUE-009) or the project's
+        # default outputs directory on first launch.
+        left.addSpacing(6)
+        left.addWidget(self._heading("Output folder"))
+        out_pick_row = QHBoxLayout()
+        self.output_edit = QLineEdit()
+        self.output_edit.setReadOnly(True)
+        last_output = self._settings.value("last_output_dir", "", type=str)
+        initial_output = Path(last_output) if last_output else DEFAULT_OUTPUT_ROOT
+        self.output_edit.setText(str(initial_output))
+        self.output_edit.setToolTip(str(initial_output))
+        out_pick_row.addWidget(self.output_edit, stretch=1)
+        self.output_browse_btn = QPushButton("Change...")
+        self.output_browse_btn.clicked.connect(self._on_browse_output)
+        out_pick_row.addWidget(self.output_browse_btn)
+        left.addLayout(out_pick_row)
+
+        # Open-output convenience button (the only output-side button
+        # we keep — ISSUE-014 removed "Open SVG" which was redundant
+        # since the output folder already contains the SVG).
         self.open_output_btn = QPushButton("Open Output Folder")
         self.open_output_btn.clicked.connect(self._on_open_output)
-        out_row.addWidget(self.open_output_btn)
-        self.open_svg_btn = QPushButton("Open SVG")
-        self.open_svg_btn.clicked.connect(self._on_open_svg)
-        out_row.addWidget(self.open_svg_btn)
-        left.addLayout(out_row)
+        left.addWidget(self.open_output_btn)
 
         split.addWidget(left_panel)
 
@@ -356,10 +486,23 @@ class MainWindow(QMainWindow):
     # UI event handlers
     # ------------------------------------------------------------------
 
+    def _last_input_dir(self) -> Path:
+        """Return the remembered last-used input directory, falling back
+        to the project's raw_images folder, then the repo root."""
+        v = self._settings.value("last_input_dir", "", type=str)
+        if v and Path(v).exists():
+            return Path(v)
+        proj_default = REPO / "data" / "inputs" / "raw_images"
+        return proj_default if proj_default.exists() else REPO
+
+    def _remember_input_dir(self, path: Path) -> None:
+        self._settings.setValue("last_input_dir", str(path))
+
+    def _remember_output_dir(self, path: Path) -> None:
+        self._settings.setValue("last_output_dir", str(path))
+
     def _on_browse_file(self) -> None:
-        start_dir = REPO / "data" / "inputs" / "raw_images"
-        if not start_dir.exists():
-            start_dir = REPO
+        start_dir = self._last_input_dir()
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select one or more CDS input files",
@@ -371,19 +514,21 @@ class MainWindow(QMainWindow):
         for p in paths:
             if self._add_input_row(Path(p)):
                 added += 1
+        if paths:
+            # Remember the folder of the first selected file (ISSUE-009)
+            self._remember_input_dir(Path(paths[0]).parent)
         if added:
             self.footer.setText(f"Added {added} file(s).")
 
     def _on_browse_folder(self) -> None:
-        start_dir = REPO / "data" / "inputs" / "raw_images"
-        if not start_dir.exists():
-            start_dir = REPO
+        start_dir = self._last_input_dir()
         folder = QFileDialog.getExistingDirectory(
             self, "Select an order folder", str(start_dir)
         )
         if not folder:
             return
         folder_path = Path(folder)
+        self._remember_input_dir(folder_path)
         candidates = sorted(
             p for p in folder_path.iterdir()
             if p.is_file()
@@ -402,6 +547,36 @@ class MainWindow(QMainWindow):
             self.footer.setText(
                 f"Added {added} file(s) from {folder_path.name}."
             )
+
+    def _on_browse_output(self) -> None:
+        """User chooses where the output folders should be created (ISSUE-008)."""
+        current = self.output_edit.text().strip()
+        start_dir = (Path(current) if current and Path(current).exists()
+                     else self._last_input_dir())
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose output folder",
+            str(start_dir),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not folder:
+            return
+        chosen = Path(folder)
+        self.output_edit.setText(str(chosen))
+        self.output_edit.setToolTip(str(chosen))
+        self._remember_output_dir(chosen)
+
+    def _current_output_root(self) -> Path:
+        """Return the user's chosen output root, falling back to the default."""
+        v = self.output_edit.text().strip()
+        return Path(v) if v else DEFAULT_OUTPUT_ROOT
+
+    def _current_debug_mode(self) -> str:
+        """Return 'off' or 'full' from the dropdown."""
+        return self.debug_combo.currentData() or "off"
+
+    def _on_debug_mode_changed(self, _idx: int) -> None:
+        """Remember the user's last debug-mode choice across launches."""
+        self._settings.setValue("last_debug_mode", self._current_debug_mode())
 
     def _on_remove_selected(self) -> None:
         rows = sorted(
@@ -478,10 +653,17 @@ class MainWindow(QMainWindow):
             f"\n=========================================================="
         )
 
-        self._thread, self._worker = make_worker_thread(path, template_id)
+        self._last_rectified_path = None
+        self._thread, self._worker = make_worker_thread(
+            path,
+            template_id,
+            output_root=self._current_output_root(),
+            debug_mode=self._current_debug_mode(),
+        )
         self._worker.stage_changed.connect(self._on_stage_changed)
         self._worker.log_line.connect(self._append_log)
         self._worker.preview_ready.connect(self._on_preview_ready)
+        self._worker.rectified_saved.connect(self._on_rectified_saved)
         self._worker.finished_signal.connect(self._on_one_file_done)
         self._thread.start()
 
@@ -540,8 +722,15 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(max(0, min(100, int(pct))))
 
     def _on_preview_ready(self, path: str) -> None:
-        pm = QPixmap(path)
-        if pm.isNull():
+        """Show a thumbnail preview safely (ISSUE-010).
+
+        Previously called ``QPixmap(path)`` directly which would silently
+        reject anything > Qt's 256 MB allocation limit (production
+        rectified PNGs blow past that).  We now load via cv2 + downscale
+        to bounded memory before handing to Qt.
+        """
+        pm = _load_thumbnail_pixmap(Path(path))
+        if pm is None or pm.isNull():
             return
         scaled = pm.scaled(
             self.preview_label.size(),
@@ -550,17 +739,27 @@ class MainWindow(QMainWindow):
         )
         self.preview_label.setPixmap(scaled)
 
-    def _on_open_output(self) -> None:
-        if self._last_result and self._last_result.output_dir:
-            _open_in_explorer(self._last_result.output_dir)
-        else:
-            root = REPO / "data" / "outputs" / "end_to_end"
-            root.mkdir(parents=True, exist_ok=True)
-            _open_in_explorer(root)
+    def _on_rectified_saved(self, path: str) -> None:
+        """The pipeline saved the rectified PNG before Phase 2 started
+        (ISSUE-006).  Update footer status so the user knows their
+        rectified output is safe even if later stages hang or fail."""
+        self._last_rectified_path = Path(path)
+        self.footer.setText(
+            f"Rectified saved: {Path(path).name}  "
+            f"(safe even if vectorisation fails)"
+        )
 
-    def _on_open_svg(self) -> None:
-        if self._last_result and self._last_result.svg_path:
-            _open_in_explorer(self._last_result.svg_path)
-        else:
-            QMessageBox.information(self, "No SVG yet",
-                                    "Run a vectorisation first.")
+    def _on_open_output(self) -> None:
+        # Priority order for "open output folder":
+        # 1) the per-file output folder of the last completed run
+        # 2) the per-stem folder above that, so all timestamps are visible
+        # 3) the user-chosen output root
+        target: Path | None = None
+        if self._last_result and self._last_result.output_dir:
+            target = self._last_result.output_dir
+        if target is None and self._last_rectified_path is not None:
+            target = self._last_rectified_path.parent
+        if target is None:
+            target = self._current_output_root()
+            target.mkdir(parents=True, exist_ok=True)
+        _open_in_explorer(target)

@@ -20,15 +20,24 @@ class PipelineWorker(QObject):
     # Signals are how the worker tells the UI thread what to do.  Qt
     # marshals them across threads automatically, so the slots run on
     # the UI thread even though the worker is on a background thread.
-    stage_changed   = pyqtSignal(str, int)        # (label, percent)
-    log_line        = pyqtSignal(str)             # (one line of log)
-    preview_ready   = pyqtSignal(str)             # (path to preview PNG)
-    finished_signal = pyqtSignal(object)          # (RunResult)
+    stage_changed     = pyqtSignal(str, int)        # (label, percent)
+    log_line          = pyqtSignal(str)             # (one line of log)
+    preview_ready     = pyqtSignal(str)             # (path to preview PNG)
+    rectified_saved   = pyqtSignal(str)             # (path to <stem>_rectified.png)
+    finished_signal   = pyqtSignal(object)          # (RunResult)
 
-    def __init__(self, input_path: Path, template_id: str) -> None:
+    def __init__(
+        self,
+        input_path: Path,
+        template_id: str,
+        output_root: Path | None = None,
+        debug_mode: str = "off",
+    ) -> None:
         super().__init__()
         self._input_path = Path(input_path)
         self._template_id = template_id
+        self._output_root = Path(output_root) if output_root else None
+        self._debug_mode = (debug_mode or "off").lower()
         self._cancel_event = Event()
 
     def request_cancel(self) -> None:
@@ -41,12 +50,15 @@ class PipelineWorker(QObject):
             on_stage=lambda label, pct: self.stage_changed.emit(label, pct),
             on_log=lambda line: self.log_line.emit(line),
             on_preview=lambda p: self.preview_ready.emit(str(p)),
+            on_rectified_saved=lambda p: self.rectified_saved.emit(str(p)),
             is_cancelled=self._cancel_event.is_set,
         )
         result: RunResult = run_pipeline(
             input_path=self._input_path,
             template_id=self._template_id,
             callbacks=callbacks,
+            output_root=self._output_root,
+            debug_mode=self._debug_mode,
         )
         self.finished_signal.emit(result)
 
@@ -54,6 +66,8 @@ class PipelineWorker(QObject):
 def make_worker_thread(
     input_path: Path,
     template_id: str,
+    output_root: Path | None = None,
+    debug_mode: str = "off",
 ) -> tuple[QThread, PipelineWorker]:
     """Create a started-and-ready worker + thread pair.
 
@@ -61,7 +75,12 @@ def make_worker_thread(
     signals and calling ``thread.start()``.
     """
     thread = QThread()
-    worker = PipelineWorker(input_path=input_path, template_id=template_id)
+    worker = PipelineWorker(
+        input_path=input_path,
+        template_id=template_id,
+        output_root=output_root,
+        debug_mode=debug_mode,
+    )
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.finished_signal.connect(thread.quit)
